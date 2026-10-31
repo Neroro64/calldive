@@ -1,6 +1,6 @@
 [package]
 name = "calldive"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Interactive TUI code review: entry-point driven, call-graph aware diffs"
 license = "MIT"

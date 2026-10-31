@@ -280,6 +280,72 @@ fn identical_refs_report_no_changes() {
 }
 
 #[test]
+fn test_functions_hidden_by_default_included_with_tests_flag() {
+    let repo = Repo::new("testfilter");
+    repo.write(
+        "src/lib.rs",
+        r#"pub fn validate(amount: u32) -> bool { amount > 0 }
+
+pub fn process(order: &Order) -> bool {
+    validate(order.total)
+}
+
+pub struct Order { pub total: u32 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn test_validate_rejects_zero() {
+        assert!(!validate(0));
+    }
+}
+"#,
+    );
+    repo.commit_all("base");
+    repo.write(
+        "src/lib.rs",
+        r#"pub fn validate(amount: u32) -> bool { amount > 0 && amount < 10_000 }
+
+pub fn process(order: &Order) -> bool {
+    validate(order.total)
+}
+
+pub struct Order { pub total: u32 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn test_validate_rejects_zero() {
+        assert!(!validate(0));
+    }
+    #[test]
+    fn test_validate_rejects_huge() {
+        assert!(!validate(20_000));
+    }
+}
+"#,
+    );
+    repo.commit_all("head");
+
+    // default: test module fns are not nodes; the change is visible via
+    // validate alone
+    let (code, out, err) = repo.run(&["HEAD~1", "HEAD", "--dump"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(!out.contains("test_validate"), "tests leaked:\n{out}");
+    assert!(out.contains("~ validate"));
+
+    // --tests brings them in; the new test fn shows as added
+    let (code, out, err) = repo.run(&["HEAD~1", "HEAD", "--tests", "--dump"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(
+        out.contains("+ test_validate_rejects_huge"),
+        "missing new test:\n{out}"
+    );
+}
+
+#[test]
 fn all_flag_includes_clean_entry_points() {
     // base and head differ only inside flag_for_review; everything else is
     // unchanged, and unused_helper is a clean, uncalled entry point

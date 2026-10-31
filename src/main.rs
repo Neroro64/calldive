@@ -40,6 +40,10 @@ struct Args {
     #[arg(long)]
     all: bool,
 
+    /// include functions inside test modules / test files
+    #[arg(long)]
+    tests: bool,
+
     /// start with unchanged branches hidden
     #[arg(long)]
     focus: bool,
@@ -116,6 +120,7 @@ fn main() -> Result<()> {
     let inputs = Inputs {
         files,
         extra_head: extra_files,
+        include_tests: args.tests,
     };
     let a = analysis::analyze(&inputs);
 
@@ -167,6 +172,10 @@ fn main() -> Result<()> {
         );
         let expanded: HashSet<String> = roots.iter().cloned().collect();
         let rows = analysis::build_rows(&a, &roots, &expanded, false);
+        let mut file_counts: HashMap<String, usize> = HashMap::new();
+        for n in a.nodes.values() {
+            *file_counts.entry(short(&n.file).to_string()).or_default() += 1;
+        }
         for r in &rows {
             let n = &a.nodes[&r.key];
             let indent = "  ".repeat(r.depth);
@@ -180,7 +189,7 @@ fn main() -> Result<()> {
                 indent,
                 n.status.glyph(),
                 n.name,
-                short(&n.file),
+                display_file(&n.file, &file_counts),
                 n.start_row + 1,
                 n.status.glyph(),
                 n.end_row,
@@ -199,4 +208,18 @@ fn main() -> Result<()> {
 
 fn short(f: &str) -> &str {
     f.rsplit('/').next().unwrap_or(f)
+}
+
+/// Display path for a file: basename, or `parent/base` when basenames
+/// collide across the review set (e.g. several crates' lib.rs).
+fn display_file(f: &str, counts: &std::collections::HashMap<String, usize>) -> String {
+    let base = short(f);
+    if counts.get(base).copied().unwrap_or(0) > 1 {
+        let mut parts: Vec<&str> = f.split('/').collect();
+        let file = parts.pop().unwrap_or("");
+        let parent = parts.pop().unwrap_or("");
+        format!("{parent}/{file}")
+    } else {
+        base.to_string()
+    }
 }

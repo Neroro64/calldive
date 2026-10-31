@@ -68,6 +68,8 @@ pub struct Inputs {
     /// unchanged files at head, parsed ONLY for caller edges into changed
     /// symbols (they never become nodes themselves)
     pub extra_head: Vec<(String, String)>,
+    /// include functions inside test modules / test files
+    pub include_tests: bool,
 }
 
 pub fn analyze(inputs: &Inputs) -> Analysis {
@@ -81,6 +83,9 @@ pub fn analyze(inputs: &Inputs) -> Analysis {
         if let Some(src) = base_src {
             if let Some(pf) = syntax::parse_file(path, src) {
                 for (i, f) in pf.fns.iter().enumerate() {
+                    if f.is_test && !inputs.include_tests {
+                        continue;
+                    }
                     base_map.insert(node_key(path, &f.name), (i, path.clone(), pf.clone()));
                 }
             }
@@ -88,6 +93,9 @@ pub fn analyze(inputs: &Inputs) -> Analysis {
         if let Some(src) = head_src {
             if let Some(pf) = syntax::parse_file(path, src) {
                 for (i, f) in pf.fns.iter().enumerate() {
+                    if f.is_test && !inputs.include_tests {
+                        continue;
+                    }
                     head_map.insert(node_key(path, &f.name), (i, path.clone(), pf.clone()));
                 }
                 head_srcs.insert(path.clone(), src.clone());
@@ -251,6 +259,9 @@ pub fn analyze(inputs: &Inputs) -> Analysis {
     // disqualify their callees from entry-point status
     for (path, pf) in &extra_parsed {
         for (i, f) in pf.fns.iter().enumerate() {
+            if f.is_test && !inputs.include_tests {
+                continue;
+            }
             for c in &pf.calls {
                 if c.caller != i {
                     continue;
@@ -528,6 +539,7 @@ mod tests {
                 head.map(|s| s.to_string()),
             )],
             extra_head: vec![],
+            include_tests: false,
         };
         analyze(&inputs)
     }
@@ -544,6 +556,7 @@ mod tests {
             )],
             // unchanged file m2.rs calls a()
             extra_head: vec![("m2.rs".to_string(), "fn top() { a(); }\n".to_string())],
+            include_tests: false,
         };
         let a = analyze(&inputs);
         // b changed; a unchanged but reaches a change
@@ -611,6 +624,26 @@ mod tests {
             .map(|k| k.rsplit("::").next().unwrap())
             .collect();
         assert!(eps.contains("gone") && eps.contains("new_thing"));
+    }
+
+    #[test]
+    fn test_fns_filtered_unless_included() {
+        let base = "fn a() { b(); }\nfn b() {}\n";
+        let head = "fn a() { b(); }\nfn b() { c(); }\nfn c() {}\n\n#[cfg(test)]\nmod tests {\n    fn test_b() { super::b(); }\n}\n";
+        let mk = |include_tests: bool| Inputs {
+            files: vec![(
+                "m.rs".to_string(),
+                Some(base.to_string()),
+                Some(head.to_string()),
+            )],
+            extra_head: vec![],
+            include_tests,
+        };
+        let a = analyze(&mk(false));
+        assert!(a.nodes.contains_key(&node_key("m.rs", "c")));
+        assert!(!a.nodes.contains_key(&node_key("m.rs", "test_b")));
+        let a = analyze(&mk(true));
+        assert!(a.nodes.contains_key(&node_key("m.rs", "test_b")));
     }
 
     #[test]

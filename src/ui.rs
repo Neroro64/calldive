@@ -32,6 +32,8 @@ pub struct App<'a> {
     pub flash: Option<String>,
     /// rendered detail pane (header + diff) for the current selection
     pub detail: Vec<Line<'static>>,
+    /// basename -> occurrence count, for unambiguous file display
+    pub file_counts: HashMap<String, usize>,
     /// base revision sources, keyed by file path
     pub base_srcs: &'a HashMap<String, String>,
 }
@@ -56,6 +58,13 @@ impl<'a> App<'a> {
             quit: false,
             flash: None,
             detail: vec![],
+            file_counts: {
+                let mut m: HashMap<String, usize> = HashMap::new();
+                for n in a.nodes.values() {
+                    *m.entry(short_file(&n.file)).or_default() += 1;
+                }
+                m
+            },
             base_srcs,
         };
         let roots = app.roots.clone();
@@ -107,7 +116,12 @@ impl<'a> App<'a> {
             ),
         ]));
         self.detail.push(Line::from(Span::styled(
-            format!("{} : rows {}-{}", n.file, n.start_row + 1, n.end_row),
+            format!(
+                "{} : rows {}-{}",
+                display_file(&n.file, &self.file_counts),
+                n.start_row + 1,
+                n.end_row
+            ),
             Style::default().fg(Color::DarkGray),
         )));
 
@@ -372,6 +386,19 @@ fn short_file(f: &str) -> String {
     f.rsplit('/').next().unwrap_or(f).to_string()
 }
 
+/// basename, or `parent/base` when basenames collide in this review set
+fn display_file(f: &str, counts: &HashMap<String, usize>) -> String {
+    let base = short_file(f);
+    if counts.get(&base).copied().unwrap_or(0) > 1 {
+        let mut parts: Vec<&str> = f.split('/').collect();
+        let file = parts.pop().unwrap_or("");
+        let parent = parts.pop().unwrap_or("");
+        format!("{parent}/{file}")
+    } else {
+        base
+    }
+}
+
 pub fn draw(f: &mut ratatui::Frame, app: &mut App) {
     let root = ratatui::layout::Layout::default()
         .direction(Direction::Vertical)
@@ -445,7 +472,11 @@ pub fn draw(f: &mut ratatui::Frame, app: &mut App) {
                 ),
                 Span::styled(n.name.clone(), name_style),
                 Span::styled(
-                    format!("  {}::{}", short_file(&n.file), n.start_row + 1),
+                    format!(
+                        "  {}::{}",
+                        display_file(&n.file, &app.file_counts),
+                        n.start_row + 1
+                    ),
                     Style::default().fg(Color::DarkGray),
                 ),
             ];
