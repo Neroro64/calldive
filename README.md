@@ -65,7 +65,9 @@ Keys: `j/k` move · `enter`/`l` toggle expansion · `h` collapse the row or its
 nearest expanded ancestor · `x` expand subtree (depth limit 5) · `e` collapse
 to roots · `f` focus relevant branches · `g/G` first/last row (top/bottom in
 details) · `tab` switch pane · `Shift+H`/`Shift+L` scroll the focused panel
-left/right by one column (each panel keeps its own offset) · `q` quit.
+left/right by 8 columns (each panel keeps its own offset) · `q` quit.
+In the diff panel, `Ctrl+D` / `Ctrl+U` scroll down/up by half a visible page,
+stopping at the bottom/top.
 The tree starts scrolled past the first selected symbol's namespace prefix;
 use `Shift+H` to reveal the full qualification.
 In the detail pane, diff markers are

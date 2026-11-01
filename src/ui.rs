@@ -3,7 +3,7 @@
 use crate::analysis::{self, Analysis, Status, TreeRow};
 use crate::diffview::{fn_diff, DiffLine, Sign};
 use ratatui::{
-    crossterm::event::{self, Event, KeyCode, KeyEventKind},
+    crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     layout::{Constraint, Direction},
     style::{Color, Modifier, Style},
     text::{Line, Span},
@@ -262,6 +262,25 @@ impl<'a> App<'a> {
         }
     }
 
+    fn handle_event(&mut self, key: KeyEvent) {
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('d' | 'u'))
+        {
+            if self.focus == Focus::Detail {
+                let step = (self.detail_viewport / 2).max(1);
+                self.detail_scroll = if key.code == KeyCode::Char('d') {
+                    self.detail_scroll
+                        .saturating_add(step)
+                        .min(self.max_detail_scroll())
+                } else {
+                    self.detail_scroll.saturating_sub(step)
+                };
+            }
+            return;
+        }
+        self.handle_key(key.code);
+    }
+
     pub fn handle_key(&mut self, code: KeyCode) {
         match code {
             KeyCode::Char('H') | KeyCode::Char('L') => {
@@ -270,9 +289,9 @@ impl<'a> App<'a> {
                     Focus::Detail => &mut self.detail_horizontal,
                 };
                 *offset = if code == KeyCode::Char('H') {
-                    offset.saturating_sub(1)
+                    offset.saturating_sub(8)
                 } else {
-                    offset.saturating_add(1)
+                    offset.saturating_add(8)
                 };
             }
             KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
@@ -536,7 +555,7 @@ pub fn draw(f: &mut ratatui::Frame, app: &mut App) {
     let help = if let Some(msg) = flash {
         format!(" {msg}")
     } else {
-        " j/k move · H/L scroll horizontally · g/G top/bottom · enter expand · x expand subtree · e collapse to roots · f focus changes · tab pane · q quit "
+        " j/k move · H/L scroll 8 cols · Ctrl+D/U half-page diff · g/G top/bottom · enter expand · x subtree · e collapse · f focus · tab pane · q quit "
             .to_string()
     };
     f.render_widget(
@@ -582,7 +601,7 @@ pub fn run(app: &mut App) -> anyhow::Result<()> {
             terminal.draw(|f| draw(f, app))?;
             if let Event::Key(k) = event::read()? {
                 if k.kind == KeyEventKind::Press {
-                    app.handle_key(k.code);
+                    app.handle_event(k);
                 }
             }
             if app.quit {
@@ -629,16 +648,47 @@ mod tests {
         app.handle_key(KeyCode::Char('L'));
         terminal.draw(|f| draw(f, &mut app)).unwrap();
         let after = terminal.backend().buffer();
-        assert_eq!(after[(1, 2)].symbol(), before[(2, 2)].symbol());
+        assert_eq!(after[(1, 2)].symbol(), before[(9, 2)].symbol());
         assert_eq!(after[(46, 2)], before[(46, 2)]);
         app.handle_key(KeyCode::Tab);
         app.handle_key(KeyCode::Char('L'));
         terminal.draw(|f| draw(f, &mut app)).unwrap();
-        assert_eq!(terminal.backend().buffer()[(46, 2)].symbol(), "a");
+        assert_eq!(terminal.backend().buffer()[(46, 2)].symbol(), "[");
         app.handle_key(KeyCode::Char('H'));
         app.handle_key(KeyCode::Char('H'));
         assert_eq!(app.detail_horizontal, 0);
-        assert_eq!(app.tree_horizontal, 1);
+        assert_eq!(app.tree_horizontal, 8);
+    }
+
+    #[test]
+    fn control_paging_uses_diff_viewport_and_clamps_at_edges() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let base = format!("fn target() {{\n{}\n}}", "    old();\n".repeat(50));
+        let head = base.replace("old", "new");
+        let a = analyze(&base, &head);
+        let mut app = target_app(&a);
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let down = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL);
+        let up = KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL);
+        app.handle_event(down);
+        assert_eq!(app.detail_scroll, 0);
+        app.handle_key(KeyCode::Tab);
+        app.handle_event(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        assert_eq!(app.detail_scroll, 0);
+        app.handle_event(down);
+        assert_eq!(app.detail_scroll, app.detail_viewport / 2);
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        app.handle_event(up);
+        assert_eq!(app.detail_scroll, 0);
+        for _ in 0..100 {
+            app.handle_event(down);
+        }
+        assert_eq!(app.detail_scroll, app.max_detail_scroll());
+        for _ in 0..100 {
+            app.handle_event(up);
+        }
+        assert_eq!(app.detail_scroll, 0);
     }
 
     #[test]
