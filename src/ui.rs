@@ -62,6 +62,15 @@ impl<'a> App<'a> {
             }
         }
         app.rebuild();
+        if let Some(row) = app.rows.get(app.sel) {
+            use unicode_width::UnicodeWidthStr;
+            let name = &a.nodes[&row.key].name;
+            let qualified = name.split('(').next().unwrap_or(name);
+            if let Some(separator) = qualified.rfind("::") {
+                let columns = row.depth * 2 + 4 + name[..separator + 2].width();
+                app.tree_horizontal = columns.min(usize::from(u16::MAX)) as u16;
+            }
+        }
         app.update_detail();
         app
     }
@@ -589,6 +598,25 @@ pub fn run(app: &mut App) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tree_starts_at_symbol_and_can_reveal_namespace() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut a = analyze("fn target() { let z = 3; }", "fn target() { let z = 4; }");
+        let key = analysis::node_key("src/lib.rs", "target");
+        a.nodes.get_mut(&key).unwrap().name = "Production::VeryLongNamespace::target(int x)".into();
+        let mut app = target_app(&a);
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        assert_eq!(terminal.backend().buffer()[(1, 2)].symbol(), "t");
+        let offset = app.tree_horizontal;
+        for _ in 0..offset {
+            app.handle_key(KeyCode::Char('H'));
+        }
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        assert_eq!(terminal.backend().buffer()[(5, 2)].symbol(), "P");
+        assert_eq!(app.detail_horizontal, 0);
+    }
 
     #[test]
     fn horizontal_scroll_moves_only_focused_panel_content() {

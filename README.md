@@ -66,6 +66,8 @@ nearest expanded ancestor · `x` expand subtree (depth limit 5) · `e` collapse
 to roots · `f` focus relevant branches · `g/G` first/last row (top/bottom in
 details) · `tab` switch pane · `Shift+H`/`Shift+L` scroll the focused panel
 left/right by one column (each panel keeps its own offset) · `q` quit.
+The tree starts scrolled past the first selected symbol's namespace prefix;
+use `Shift+H` to reveal the full qualification.
 In the detail pane, diff markers are
 `+` added lines, `-` removed lines, and a space for context; base and head line
 numbers refer to their own revisions.
