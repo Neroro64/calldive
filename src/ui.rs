@@ -7,9 +7,8 @@ use ratatui::{
     layout::{Constraint, Direction},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
 };
-use std::collections::HashMap;
 use std::collections::HashSet;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -27,24 +26,16 @@ pub struct App<'a> {
     pub sel: usize,
     pub tree_state: ListState,
     pub focus: Focus,
-    pub detail_scroll: u16,
+    pub detail_scroll: usize,
+    pub detail_viewport: usize,
     pub quit: bool,
     pub flash: Option<String>,
     /// rendered detail pane (header + diff) for the current selection
     pub detail: Vec<Line<'static>>,
-    /// basename -> occurrence count, for unambiguous file display
-    pub file_counts: HashMap<String, usize>,
-    /// base revision sources, keyed by file path
-    pub base_srcs: &'a HashMap<String, String>,
 }
 
 impl<'a> App<'a> {
-    pub fn new(
-        a: &'a Analysis,
-        roots: Vec<String>,
-        focus_mode: bool,
-        base_srcs: &'a HashMap<String, String>,
-    ) -> Self {
+    pub fn new(a: &'a Analysis, roots: Vec<String>, focus_mode: bool) -> Self {
         let mut app = Self {
             a,
             roots,
@@ -55,17 +46,10 @@ impl<'a> App<'a> {
             tree_state: ListState::default(),
             focus: Focus::Tree,
             detail_scroll: 0,
+            detail_viewport: 0,
             quit: false,
             flash: None,
             detail: vec![],
-            file_counts: {
-                let mut m: HashMap<String, usize> = HashMap::new();
-                for n in a.nodes.values() {
-                    *m.entry(short_file(&n.file)).or_default() += 1;
-                }
-                m
-            },
-            base_srcs,
         };
         let roots = app.roots.clone();
         for r in &roots {
@@ -99,7 +83,6 @@ impl<'a> App<'a> {
         let Some(n) = self.a.nodes.get(&key) else {
             return;
         };
-        let n = n.clone();
 
         // header
         self.detail.push(Line::from(vec![
@@ -115,27 +98,29 @@ impl<'a> App<'a> {
                 Style::default().fg(status_color(n.status)),
             ),
         ]));
-        self.detail.push(Line::from(Span::styled(
-            format!(
-                "{} : rows {}-{}",
-                display_file(&n.file, &self.file_counts),
-                n.start_row + 1,
-                n.end_row
-            ),
-            Style::default().fg(Color::DarkGray),
-        )));
+        if let Some(span) = n.head.as_ref().or(n.base.as_ref()) {
+            self.detail.push(Line::from(Span::styled(
+                format!(
+                    "{} : rows {}-{}",
+                    self.a.label(&span.file),
+                    span.start_row + 1,
+                    span.end_row
+                ),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+        if n.status == Status::Moved {
+            if let (Some(base), Some(origin)) = (&n.base, &n.moved_from) {
+                self.detail.push(Line::from(format!(
+                    "moved from {}::{origin}",
+                    self.a.label(&base.file)
+                )));
+            }
+        }
 
         // callers (upstream impact)
-        let in_scope: Vec<&String> = n
-            .callers
-            .iter()
-            .filter(|c| self.a.nodes.contains_key(*c))
-            .collect();
-        let external: Vec<&String> = n
-            .callers
-            .iter()
-            .filter(|c| !self.a.nodes.contains_key(*c))
-            .collect();
+        let in_scope = &n.callers;
+        let external = &n.external_callers;
         let mut cl = vec![Span::raw("callers: ")];
         if in_scope.is_empty() && external.is_empty() {
             cl.push(Span::styled(
@@ -143,19 +128,19 @@ impl<'a> App<'a> {
                 Style::default().fg(Color::Cyan),
             ));
         } else {
-            for (i, c) in in_scope.iter().enumerate() {
+            for (i, c) in in_scope.iter().take(5).enumerate() {
                 if i > 0 {
                     cl.push(Span::raw(", "));
                 }
-                if let Some(cn) = self.a.nodes.get(*c) {
+                if let Some(cn) = self.a.nodes.get(c) {
                     cl.push(Span::styled(
                         cn.name.clone(),
                         Style::default().fg(status_color(cn.status)),
                     ));
                 }
-                if i == 5 {
-                    cl.push(Span::raw(" …"));
-                }
+            }
+            if in_scope.len() > 5 {
+                cl.push(Span::raw(format!(" … +{} more", in_scope.len() - 5)));
             }
             if !external.is_empty() {
                 if !in_scope.is_empty() {
@@ -164,10 +149,18 @@ impl<'a> App<'a> {
                 let names: Vec<String> = external
                     .iter()
                     .take(3)
-                    .map(|k| k.rsplit("::").next().unwrap_or(k).to_string())
+                    .map(|k| match k.split_once("::") {
+                        Some((path, qual)) => format!("{}::{qual}", self.a.label(path)),
+                        None => self.a.label(k).to_string(),
+                    })
                     .collect();
+                let more = if external.len() > 3 {
+                    format!(" +{} more", external.len() - 3)
+                } else {
+                    String::new()
+                };
                 cl.push(Span::styled(
-                    format!("{} (outside diff)", names.join(", ")),
+                    format!("{}{more} (outside diff)", names.join(", ")),
                     Style::default().fg(Color::Cyan),
                 ));
             }
@@ -180,7 +173,7 @@ impl<'a> App<'a> {
             cal.push(Span::styled("leaf", Style::default().fg(Color::DarkGray)));
         } else {
             let mut first = true;
-            for c in &n.callees {
+            for c in n.callees.iter().take(8) {
                 if !first {
                     cal.push(Span::raw(", "));
                 }
@@ -192,7 +185,11 @@ impl<'a> App<'a> {
                     ));
                 }
             }
-            for ext in &n.lost_callees {
+            for ext in n
+                .lost_callees
+                .iter()
+                .take(8usize.saturating_sub(n.callees.len()))
+            {
                 if !first {
                     cal.push(Span::raw(", "));
                 }
@@ -202,23 +199,16 @@ impl<'a> App<'a> {
                     Style::default().fg(Color::DarkGray),
                 ));
             }
+            let total = n.callees.len() + n.lost_callees.len();
+            if total > 8 {
+                cal.push(Span::raw(format!(" … +{} more", total - 8)));
+            }
         }
         self.detail.push(Line::from(cal));
         self.detail.push(Line::from(""));
 
-        // diff: extract body slices from base/head sources
-        let head_src: Option<String> = if n.status == Status::Removed {
-            None
-        } else {
-            Some(slice_rows(&n.src, n.start_row, n.end_row))
-        };
-        let base_src: Option<String> = match n.status {
-            Status::Added => None,
-            _ => self
-                .base_srcs
-                .get(&n.file)
-                .map(|src| slice_rows(src, n.start_row, n.end_row)),
-        };
+        let head_src = self.a.head_body(n);
+        let base_src = self.a.base_body(n);
         let diff: Vec<DiffLine> = fn_diff(base_src.as_deref(), head_src.as_deref());
         if diff.is_empty() {
             self.detail.push(Line::from(Span::styled(
@@ -232,7 +222,10 @@ impl<'a> App<'a> {
                     Sign::Minus => Style::default().fg(Color::Red),
                     Sign::Same => Style::default().fg(Color::DarkGray),
                 };
-                self.detail.push(Line::from(Span::styled(dl.text, style)));
+                self.detail.push(Line::from(Span::styled(
+                    format!("{}{}", dl.sign.marker(), dl.text),
+                    style,
+                )));
             }
         }
     }
@@ -292,7 +285,7 @@ impl<'a> App<'a> {
                     self.sel = self.rows.len().saturating_sub(1);
                     self.update_detail();
                 } else {
-                    self.detail_scroll = u16::MAX / 2;
+                    self.detail_scroll = self.max_detail_scroll();
                 }
             }
             KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Char('l') => self.toggle_expand(),
@@ -349,15 +342,12 @@ impl<'a> App<'a> {
             }
             _ => {}
         }
+        self.detail_scroll = self.detail_scroll.min(self.max_detail_scroll());
     }
-}
 
-fn slice_rows(src: &str, start: usize, end: usize) -> String {
-    src.lines()
-        .skip(start)
-        .take(end.saturating_sub(start))
-        .collect::<Vec<_>>()
-        .join("\n")
+    fn max_detail_scroll(&self) -> usize {
+        self.detail.len().saturating_sub(self.detail_viewport)
+    }
 }
 
 fn expand_all(a: &Analysis, key: &str, expanded: &mut HashSet<String>, depth: usize) {
@@ -366,8 +356,8 @@ fn expand_all(a: &Analysis, key: &str, expanded: &mut HashSet<String>, depth: us
     }
     expanded.insert(key.to_string());
     if let Some(n) = a.nodes.get(key) {
-        for c in n.callees.clone() {
-            expand_all(a, &c, expanded, depth - 1);
+        for c in &n.callees {
+            expand_all(a, c, expanded, depth - 1);
         }
     }
 }
@@ -379,23 +369,6 @@ fn status_color(s: Status) -> Color {
         Status::BodyChanged => Color::Yellow,
         Status::Moved => Color::Cyan,
         Status::Unchanged => Color::DarkGray,
-    }
-}
-
-fn short_file(f: &str) -> String {
-    f.rsplit('/').next().unwrap_or(f).to_string()
-}
-
-/// basename, or `parent/base` when basenames collide in this review set
-fn display_file(f: &str, counts: &HashMap<String, usize>) -> String {
-    let base = short_file(f);
-    if counts.get(&base).copied().unwrap_or(0) > 1 {
-        let mut parts: Vec<&str> = f.split('/').collect();
-        let file = parts.pop().unwrap_or("");
-        let parent = parts.pop().unwrap_or("");
-        format!("{parent}/{file}")
-    } else {
-        base
     }
 }
 
@@ -473,9 +446,12 @@ pub fn draw(f: &mut ratatui::Frame, app: &mut App) {
                 Span::styled(n.name.clone(), name_style),
                 Span::styled(
                     format!(
-                        "  {}::{}",
-                        display_file(&n.file, &app.file_counts),
-                        n.start_row + 1
+                        "  {}:{}",
+                        app.a.label(&n.file),
+                        n.head
+                            .as_ref()
+                            .or(n.base.as_ref())
+                            .map_or(0, |span| span.start_row + 1)
                     ),
                     Style::default().fg(Color::DarkGray),
                 ),
@@ -512,10 +488,21 @@ pub fn draw(f: &mut ratatui::Frame, app: &mut App) {
         } else {
             Style::default().fg(Color::DarkGray)
         });
-    let para = Paragraph::new(app.detail.clone())
-        .block(detail_block)
-        .wrap(Wrap { trim: false })
-        .scroll((app.detail_scroll, 0));
+    app.detail_viewport = usize::from(detail_block.inner(main[1]).height);
+    app.detail_scroll = app.detail_scroll.min(app.max_detail_scroll());
+    let end = (app.detail_scroll + app.detail_viewport).min(app.detail.len());
+    let visible: Vec<Line<'_>> = app.detail[app.detail_scroll..end]
+        .iter()
+        .map(|line| {
+            Line::from(
+                line.spans
+                    .iter()
+                    .map(|span| Span::styled(span.content.as_ref(), span.style))
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect();
+    let para = Paragraph::new(visible).block(detail_block);
     f.render_widget(para, main[1]);
 
     // footer
@@ -523,7 +510,7 @@ pub fn draw(f: &mut ratatui::Frame, app: &mut App) {
     let help = if let Some(msg) = flash {
         format!(" {msg}")
     } else {
-        " j/k move · enter expand · x expand subtree · f focus changes · tab pane · q quit "
+        " j/k move · g/G top/bottom · enter expand · x expand subtree · e collapse to roots · f focus changes · tab pane · q quit "
             .to_string()
     };
     f.render_widget(
@@ -553,4 +540,84 @@ pub fn run(app: &mut App) -> anyhow::Result<()> {
     })();
     ratatui::restore();
     res
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn analyze(base: &str, head: &str) -> Analysis {
+        analysis::analyze(&analysis::Inputs {
+            files: vec![("src/lib.rs".into(), Some(base.into()), Some(head.into()))],
+            extra_head: vec![],
+            include_tests: true,
+        })
+    }
+
+    fn target_app(a: &Analysis) -> App<'_> {
+        let key = analysis::node_key("src/lib.rs", "target");
+        App::new(a, vec![key], false)
+    }
+
+    fn plain(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    #[test]
+    fn shifted_function_diff_uses_each_revision_span() {
+        let base = "fn target() {\n    let z = 3;\n}\n";
+        let head = "// one\n// two\n// three\nfn target() {\n    let z = 4;\n}\n";
+        let a = analyze(base, head);
+        let app = target_app(&a);
+        let lines: Vec<String> = app.detail.iter().map(plain).collect();
+        assert!(lines.iter().any(|line| line == "-     let z = 3;"));
+        assert!(lines.iter().any(|line| line == "+     let z = 4;"));
+    }
+
+    #[test]
+    fn callers_are_capped_with_exact_remainder() {
+        let mut base = String::from("fn target() { let z = 3; }\n");
+        for i in 0..7 {
+            base.push_str(&format!("fn caller{i}() {{ target(); }}\n"));
+        }
+        let head = base.replace("let z = 3", "let z = 4");
+        let a = analyze(&base, &head);
+        let app = target_app(&a);
+        let line = app
+            .detail
+            .iter()
+            .map(plain)
+            .find(|line| line.starts_with("callers: "))
+            .unwrap();
+        assert!(line.contains("… +2 more"));
+        for i in 0..5 {
+            assert!(line.contains(&format!("caller{i}")));
+        }
+        assert!(!line.contains("caller5"));
+        assert!(!line.contains("caller6"));
+    }
+
+    #[test]
+    fn detail_scroll_stops_at_last_full_viewport() {
+        let a = analyze(
+            "fn target() {\n    let z = 3;\n}\n",
+            "fn target() {\n    let z = 4;\n}\n",
+        );
+        let mut app = target_app(&a);
+        app.focus = Focus::Detail;
+        app.detail_viewport = 3;
+        let max = app.detail.len() - app.detail_viewport;
+        app.handle_key(KeyCode::Char('G'));
+        assert_eq!(app.detail_scroll, max);
+        app.handle_key(KeyCode::Char('j'));
+        app.handle_key(KeyCode::Down);
+        assert_eq!(app.detail_scroll, max);
+        app.handle_key(KeyCode::Home);
+        assert_eq!(app.detail_scroll, 0);
+        app.handle_key(KeyCode::End);
+        assert_eq!(app.detail_scroll, max);
+    }
 }

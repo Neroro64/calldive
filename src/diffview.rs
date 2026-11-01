@@ -9,6 +9,16 @@ pub enum Sign {
     Minus,
 }
 
+impl Sign {
+    pub fn marker(self) -> &'static str {
+        match self {
+            Self::Plus => "+ ",
+            Self::Minus => "- ",
+            Self::Same => "  ",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DiffLine {
     pub sign: Sign,

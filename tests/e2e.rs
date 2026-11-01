@@ -99,7 +99,7 @@ pub fn charge(order: &Order) -> &'static str { "charged" }
 pub struct Order { pub total: u32 }
 "#,
     );
-    // unchanged caller in another file: process is NOT a true entry point
+    // An unchanged external caller does not disqualify process as an in-scope entry point.
     repo.write(
         "src/jobs.rs",
         r#"use crate::lib::process;
@@ -339,7 +339,7 @@ mod tests {
     let (code, out, err) = repo.run(&["HEAD~1", "HEAD", "--tests", "--dump"]);
     assert_eq!(code, 0, "stderr: {err}");
     assert!(
-        out.contains("+ test_validate_rejects_huge"),
+        out.contains("+ tests::test_validate_rejects_huge"),
         "missing new test:\n{out}"
     );
 }
@@ -436,15 +436,20 @@ fn csharp_c_and_cpp_review_changes_and_renames() {
         let (code, out, err) = repo.run(&["HEAD~1", "HEAD", "--dump", "-e", "run"]);
         assert_eq!(code, 0, "{path}: {err}");
         for (name, status) in [("run", '~'), ("helper", '~'), ("renamed", '>'), ("added", '+')] {
-            let line = out.lines().find(|line| line.contains(&format!("{status} {name}")))
-                .unwrap_or_else(|| panic!("{path}: missing {status} {name}:\n{out}"));
+            let qual = if path.ends_with(".cs") { format!("App::{name}") }
+                else if path.ends_with(".cpp") { format!("app::{name}") }
+                else { name.to_string() };
+            let line = out.lines().find(|line| line.contains(&format!("{status} {qual}")))
+                .unwrap_or_else(|| panic!("{path}: missing {status} {qual}:\n{out}"));
             if name == "run" {
                 assert!(!line.starts_with(' '), "{path}: root was nested: {line}");
             } else {
                 assert!(line.starts_with("  ") && !line.starts_with("    "), "{path}: callee not nested under run: {line}");
             }
         }
-        assert!(!out.contains("- legacy"), "{path}: rename reported as removal:\n{out}");
+        let legacy = if path.ends_with(".cs") { "App::legacy" }
+            else if path.ends_with(".cpp") { "app::legacy" } else { "legacy" };
+        assert!(!out.contains(&format!("- {legacy}")), "{path}: rename reported as removal:\n{out}");
     }
 }
 
@@ -692,4 +697,210 @@ fn copied_file_with_one_edit_reads_the_original_base() {
         "copy/edit summary wrong:\n{out}"
     );
     assert_fn_prefix(&out, '~', "run");
+}
+
+fn json_review(repo: &Repo) -> serde_json::Value {
+    let (code, out, err) = repo.run(&["HEAD", "--json"]);
+    assert_eq!(code, 0, "{err}");
+    serde_json::from_str(&out).expect("one JSON document")
+}
+
+fn json_node<'a>(value: &'a serde_json::Value, name: &str) -> &'a serde_json::Value {
+    value["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["name"] == name)
+        .unwrap_or_else(|| panic!("missing {name}: {value}"))
+}
+
+#[test]
+fn self_recursion_remains_an_entry() {
+    let repo = Repo::new("self-recursion");
+    let base = "fn fact(n: u32) -> u32 { if n == 0 { 1 } else { n * fact(n - 1) } }\n";
+    repo.write("src/lib.rs", base);
+    repo.commit_all("base");
+    repo.write("src/lib.rs", &base.replace("n == 0", "n <= 1"));
+    let (code, out, err) = repo.run(&["HEAD", "--dump"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("entry points: 1"), "{out}");
+    assert!(out.lines().any(|l| l.starts_with("~ fact ")), "{out}");
+}
+
+#[test]
+fn qualified_methods_and_signature_overloads_are_distinct() {
+    let repo = Repo::new("overloads");
+    let rust =
+        "struct A; struct B; impl A { fn new() -> u32 { 1 } } impl B { fn new() -> u32 { 2 } }\n";
+    let cs = "class Worker { static int Log(int x) { return x + 1; } static int Log(string s) { return s.Length; } }\n";
+    repo.write("src/lib.rs", rust);
+    repo.write("src/app.cs", cs);
+    repo.commit_all("base");
+    repo.write("src/lib.rs", &rust.replace("{ 1 }", "{ 3 }"));
+    repo.write("src/app.cs", &cs.replace("x + 1", "x + 2"));
+    let (code, out, err) = repo.run(&["HEAD", "--dump", "--all"]);
+    assert_eq!(code, 0, "{err}");
+    assert_fn_prefix(&out, '~', "A::new");
+    assert!(!out.contains("~ B::new"), "{out}");
+    assert_fn_prefix(&out, '~', "Worker::Log(int x)");
+    assert!(!out.contains("~ Worker::Log(string s)"), "{out}");
+    let (code, out, err) = repo.run(&["HEAD", "--dump", "--entry", "B::new"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("B::new"), "{out}");
+    let (code, _, err) = repo.run(&["HEAD", "--dump", "--entry", "new"]);
+    assert_ne!(code, 0);
+    assert!(
+        err.contains("src/lib.rs::A::new") && err.contains("src/lib.rs::B::new"),
+        "{err}"
+    );
+    assert!(
+        err.find("src/lib.rs::A::new") < err.find("src/lib.rs::B::new"),
+        "{err}"
+    );
+}
+
+#[test]
+fn cycle_review_order_is_deterministic() {
+    let repo = Repo::new("cycle");
+    let base = "fn e() { b(); }\nfn b() { a(); }\nfn a() { if false { b(); } c(); }\nfn c() -> u32 { 1 }\n";
+    repo.write("src/lib.rs", base);
+    repo.commit_all("base");
+    repo.write("src/lib.rs", &base.replace("{ 1 }", "{ 2 }"));
+    let mut previous = None;
+    for _ in 0..10 {
+        let (code, out, err) = repo.run(&["HEAD", "--dump"]);
+        assert_eq!(code, 0, "{err}");
+        assert!(out.contains("entry points: 1"), "{out}");
+        assert!(out.lines().any(|l| l.starts_with("  e :")), "{out}");
+        if let Some(previous) = &previous {
+            assert_eq!(&out, previous);
+        }
+        previous = Some(out);
+    }
+}
+
+#[test]
+fn unchanged_definitions_make_cross_file_calls_ambiguous() {
+    let repo = Repo::new("ambiguous-call");
+    repo.write("src/x.rs", "fn caller() -> u32 { helper() + 1 }\n");
+    repo.write("src/y.rs", "fn helper() -> u32 { 2 }\n");
+    repo.write("src/u.rs", "fn helper() -> u32 { 3 }\n");
+    repo.commit_all("base");
+    repo.write("src/x.rs", "fn caller() -> u32 { helper() + 2 }\n");
+    repo.write("src/y.rs", "fn helper() -> u32 { 4 }\n");
+    let value = json_review(&repo);
+    let caller = json_node(&value, "caller");
+    assert_eq!(caller["callees"], serde_json::json!([]));
+    assert_eq!(caller["lost_callees"], serde_json::json!(["helper"]));
+    let (code, out, err) = repo.run(&["HEAD", "--dump", "--entry", "caller"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(!out.contains("helper"), "{out}");
+}
+
+#[test]
+fn labels_use_distinct_paths_and_entry_accepts_path_suffixes() {
+    let repo = Repo::new("labels");
+    repo.write(
+        "lib.rs",
+        "fn first() -> u32 { 1 }\nfn second() -> u32 { 2 }\n",
+    );
+    for dir in ["crates/a", "crates/b"] {
+        fs::create_dir_all(repo.root.join(dir)).unwrap();
+    }
+    repo.write("crates/a/lib.rs", "fn a() -> u32 { 3 }\n");
+    repo.write("crates/b/lib.rs", "fn b() -> u32 { 4 }\n");
+    repo.write("src/x.rs", "fn run() -> u32 { 5 }\n");
+    repo.commit_all("base");
+    repo.write(
+        "lib.rs",
+        "fn first() -> u32 { 11 }\nfn second() -> u32 { 12 }\n",
+    );
+    repo.write("crates/a/lib.rs", "fn a() -> u32 { 13 }\n");
+    repo.write("crates/b/lib.rs", "fn b() -> u32 { 14 }\n");
+    repo.write("src/x.rs", "fn run() -> u32 { 15 }\n");
+    let (code, out, err) = repo.run(&["HEAD", "--dump"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("~ first :lib.rs  1-1"), "{out}");
+    assert!(out.contains("~ second :lib.rs  2-2"), "{out}");
+    assert!(!out.contains(":/lib.rs"), "{out}");
+    assert!(
+        out.contains(":a/lib.rs") && out.contains(":b/lib.rs"),
+        "{out}"
+    );
+    for entry in ["src/x.rs::run", "x.rs::run"] {
+        let (code, out, err) = repo.run(&["HEAD", "--dump", "--entry", entry]);
+        assert_eq!(code, 0, "{err}");
+        assert!(out.contains("entry points: 1"), "{out}");
+        assert_fn_prefix(&out, '~', "run");
+    }
+}
+
+#[test]
+fn json_preserves_revision_spans_moves_and_external_callers() {
+    let repo = Repo::new("json-spans");
+    repo.write(
+        "src/lib.rs",
+        "fn edited() -> u32 { 1 }\nfn alpha() -> u32 { 42 }\n",
+    );
+    repo.write("src/outside.rs", "fn outside() -> u32 { edited() }\n");
+    repo.commit_all("base");
+    repo.write("src/lib.rs", "// inserted\n// inserted\n// inserted\nfn edited() -> u32 { 2 }\nfn beta() -> u32 { 42 }\n");
+    let value = json_review(&repo);
+    assert_eq!(value["base"], "HEAD");
+    assert_eq!(value["head"], "worktree");
+    let edited = json_node(&value, "edited");
+    assert_eq!(edited["base"]["start"], 1);
+    assert_eq!(edited["head"]["start"], 4);
+    assert_ne!(edited["base"]["start"], edited["head"]["start"]);
+    assert_eq!(
+        edited["external_callers"],
+        serde_json::json!(["src/outside.rs::outside"])
+    );
+    let beta = json_node(&value, "beta");
+    assert_eq!(beta["status"], "moved");
+    assert_eq!(beta["moved_from"], "alpha");
+    assert_eq!(beta["base"]["start"], 2);
+    assert_eq!(beta["head"]["start"], 5);
+    let keys: Vec<_> = value["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["key"].as_str().unwrap())
+        .collect();
+    assert!(keys.windows(2).all(|pair| pair[0] < pair[1]));
+    let (code, _, err) = repo.run(&["HEAD", "--json", "--dump"]);
+    assert_ne!(code, 0);
+    assert!(err.contains("--json") && err.contains("--dump"), "{err}");
+}
+
+#[test]
+fn deep_generated_unchanged_expression_does_not_crash_review() {
+    let repo = Repo::new("deep-generated");
+    repo.write("src/lib.c", "int helper(void) { return 1; }\n");
+    repo.write(
+        "src/gen.c",
+        &format!(
+            "int generated(void) {{ return helper() + 0{}; }}\n",
+            "+1".repeat(20_000)
+        ),
+    );
+    repo.commit_all("base");
+    repo.write("src/lib.c", "int helper(void) { return 2; }\n");
+    let (code, out, err) = repo.run(&["HEAD", "--dump"]);
+    assert_eq!(code, 0, "{err}");
+    assert_fn_prefix(&out, '~', "helper");
+}
+
+#[test]
+fn tsx_function_after_jsx_has_its_own_body() {
+    let repo = Repo::new("tsx-after-jsx");
+    let base =
+        "function App() { return <div><span>Hello</span></div>; }\nfunction go() { return 1; }\n";
+    repo.write("src/app.tsx", base);
+    repo.commit_all("base");
+    repo.write("src/app.tsx", &base.replace("return 1", "return 2"));
+    let (code, out, err) = repo.run(&["HEAD", "--dump", "--all"]);
+    assert_eq!(code, 0, "{err}");
+    assert_fn_prefix(&out, '~', "go");
+    assert!(!out.contains("~ App"), "{out}");
 }

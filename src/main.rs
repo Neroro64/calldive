@@ -28,13 +28,17 @@ struct Args {
     #[arg(long)]
     repo: Option<String>,
 
-    /// start from this function only (simple name)
+    /// start from a function name, qualified name, path-qualified name, or exact key
     #[arg(short = 'e', long)]
     entry: Option<String>,
 
     /// print the review tree and exit (no TUI)
     #[arg(long)]
     dump: bool,
+
+    /// print the complete analysis as JSON and exit (no TUI)
+    #[arg(long, conflicts_with = "dump")]
+    json: bool,
 
     /// show unchanged entry points too
     #[arg(long)]
@@ -98,27 +102,30 @@ fn main() -> Result<()> {
     };
     let a = analysis::analyze(&inputs);
 
-    // base sources for diffing (path -> src)
-    let mut base_srcs: HashMap<String, String> = HashMap::new();
-    for (path, base_src, _) in &inputs.files {
-        if let Some(src) = base_src {
-            base_srcs.insert(path.clone(), src.clone());
-        }
-    }
-
     // roots
     let roots: Vec<String> = match &args.entry {
         Some(e) => {
-            let mut hit = a
-                .nodes
-                .keys()
-                .filter(|k| k.ends_with(&format!("::{e}")))
-                .cloned()
-                .collect::<Vec<_>>();
-            if hit.len() != 1 {
-                bail!("--entry {e}: expected exactly 1 match, got {}", hit.len());
+            if a.nodes.contains_key(e) {
+                vec![e.clone()]
+            } else {
+                let name_suffix = format!("::{e}");
+                let path_suffix = format!("/{e}");
+                let mut hits: Vec<_> = a
+                    .nodes
+                    .keys()
+                    .filter(|k| k.ends_with(&name_suffix) || k.ends_with(&path_suffix) || *k == e)
+                    .cloned()
+                    .collect();
+                hits.sort();
+                match hits.len() {
+                    0 => bail!("--entry {e}: no function matches"),
+                    1 => hits,
+                    _ => bail!(
+                        "--entry {e}: ambiguous function matches:\n{}",
+                        hits.join("\n")
+                    ),
+                }
             }
-            vec![hit.pop().unwrap()]
         }
         None => a
             .entry_points
@@ -139,6 +146,87 @@ fn main() -> Result<()> {
         head.clone()
     };
 
+    if args.json {
+        #[derive(serde::Serialize)]
+        struct JsonSpan<'a> {
+            file: &'a str,
+            start: usize,
+            end: usize,
+        }
+        #[derive(serde::Serialize)]
+        struct JsonNode<'a> {
+            key: &'a str,
+            name: &'a str,
+            file: &'a str,
+            label: &'a str,
+            status: &'a str,
+            head: Option<JsonSpan<'a>>,
+            base: Option<JsonSpan<'a>>,
+            moved_from: Option<&'a str>,
+            relevant: bool,
+            callers: &'a [String],
+            external_callers: &'a [String],
+            callees: &'a [String],
+            lost_callees: &'a [String],
+        }
+        #[derive(serde::Serialize)]
+        struct JsonSummary {
+            added: usize,
+            removed: usize,
+            changed: usize,
+            moved: usize,
+        }
+        #[derive(serde::Serialize)]
+        struct JsonAnalysis<'a> {
+            base: &'a str,
+            head: &'a str,
+            summary: JsonSummary,
+            roots: &'a [String],
+            entry_points: &'a [String],
+            nodes: Vec<JsonNode<'a>>,
+        }
+        fn span(s: &analysis::Span) -> JsonSpan<'_> {
+            JsonSpan {
+                file: s.file.as_str(),
+                start: s.start_row + 1,
+                end: s.end_row,
+            }
+        }
+        let mut nodes: Vec<_> = a.nodes.values().collect();
+        nodes.sort_by(|left, right| left.key.cmp(&right.key));
+        let output = JsonAnalysis {
+            base: &base,
+            head: &head_label,
+            summary: JsonSummary {
+                added: ad,
+                removed: rm,
+                changed: ch,
+                moved: mv,
+            },
+            roots: &roots,
+            entry_points: &a.entry_points,
+            nodes: nodes
+                .into_iter()
+                .map(|n| JsonNode {
+                    key: &n.key,
+                    name: &n.name,
+                    file: &n.file,
+                    label: a.label(&n.file),
+                    status: n.status.label(),
+                    head: n.head.as_ref().map(span),
+                    base: n.base.as_ref().map(span),
+                    moved_from: n.moved_from.as_deref(),
+                    relevant: n.relevant,
+                    callers: &n.callers,
+                    external_callers: &n.external_callers,
+                    callees: &n.callees,
+                    lost_callees: &n.lost_callees,
+                })
+                .collect(),
+        };
+        println!("{}", serde_json::to_string_pretty(&output)?);
+        return Ok(());
+    }
     if args.dump {
         println!(
             "calldive {base} → {head_label}   fns +{ad} -{rm} ~{ch} >{mv}   entry points: {}",
@@ -146,12 +234,13 @@ fn main() -> Result<()> {
         );
         let expanded: HashSet<String> = roots.iter().cloned().collect();
         let rows = analysis::build_rows(&a, &roots, &expanded, false);
-        let mut file_counts: HashMap<String, usize> = HashMap::new();
-        for n in a.nodes.values() {
-            *file_counts.entry(short(&n.file).to_string()).or_default() += 1;
-        }
         for r in &rows {
             let n = &a.nodes[&r.key];
+            let span = n
+                .head
+                .as_ref()
+                .or(n.base.as_ref())
+                .expect("node has a revision span");
             let indent = "  ".repeat(r.depth);
             let kids = if r.has_children && !expanded.contains(&r.key) {
                 " …"
@@ -159,14 +248,13 @@ fn main() -> Result<()> {
                 ""
             };
             println!(
-                "{}{} {} :{}  {}:{}-{}{}",
+                "{}{} {} :{}  {}-{}{}",
                 indent,
                 n.status.glyph(),
                 n.name,
-                display_file(&n.file, &file_counts),
-                n.start_row + 1,
-                n.status.glyph(),
-                n.end_row,
+                a.label(&n.file),
+                span.start_row + 1,
+                span.end_row,
                 kids
             );
         }
@@ -174,7 +262,7 @@ fn main() -> Result<()> {
     }
 
     // TUI
-    let mut app = ui::App::new(&a, roots, args.focus, &base_srcs);
+    let mut app = ui::App::new(&a, roots, args.focus);
     app.flash = Some(format!("reviewing {base} → {head_label}"));
     ui::run(&mut app)?;
     Ok(())
@@ -376,24 +464,6 @@ fn contains_identifier(search: &aho_corasick::AhoCorasick, source: &str) -> bool
         (hit.start() == 0 || !is_identifier(bytes[hit.start() - 1]))
             && (hit.end() == bytes.len() || !is_identifier(bytes[hit.end()]))
     })
-}
-
-fn short(f: &str) -> &str {
-    f.rsplit('/').next().unwrap_or(f)
-}
-
-/// Display path for a file: basename, or `parent/base` when basenames
-/// collide across the review set (e.g. several crates' lib.rs).
-fn display_file(f: &str, counts: &std::collections::HashMap<String, usize>) -> String {
-    let base = short(f);
-    if counts.get(base).copied().unwrap_or(0) > 1 {
-        let mut parts: Vec<&str> = f.split('/').collect();
-        let file = parts.pop().unwrap_or("");
-        let parent = parts.pop().unwrap_or("");
-        format!("{parent}/{file}")
-    } else {
-        base.to_string()
-    }
 }
 
 #[cfg(test)]
