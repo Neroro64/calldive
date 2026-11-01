@@ -28,6 +28,8 @@ pub struct App<'a> {
     pub focus: Focus,
     pub detail_scroll: usize,
     pub detail_viewport: usize,
+    pub tree_horizontal: u16,
+    pub detail_horizontal: u16,
     pub quit: bool,
     pub flash: Option<String>,
     /// rendered detail pane (header + diff) for the current selection
@@ -47,6 +49,8 @@ impl<'a> App<'a> {
             focus: Focus::Tree,
             detail_scroll: 0,
             detail_viewport: 0,
+            tree_horizontal: 0,
+            detail_horizontal: 0,
             quit: false,
             flash: None,
             detail: vec![],
@@ -251,6 +255,17 @@ impl<'a> App<'a> {
 
     pub fn handle_key(&mut self, code: KeyCode) {
         match code {
+            KeyCode::Char('H') | KeyCode::Char('L') => {
+                let offset = match self.focus {
+                    Focus::Tree => &mut self.tree_horizontal,
+                    Focus::Detail => &mut self.detail_horizontal,
+                };
+                *offset = if code == KeyCode::Char('H') {
+                    offset.saturating_sub(1)
+                } else {
+                    offset.saturating_add(1)
+                };
+            }
             KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
             KeyCode::Down | KeyCode::Char('j') => {
                 if self.focus == Focus::Tree {
@@ -461,7 +476,7 @@ pub fn draw(f: &mut ratatui::Frame, app: &mut App) {
                     s.style = s.style.add_modifier(Modifier::REVERSED);
                 }
             }
-            ListItem::new(Line::from(spans))
+            ListItem::new(scroll_line(Line::from(spans), app.tree_horizontal))
         })
         .collect();
 
@@ -502,7 +517,9 @@ pub fn draw(f: &mut ratatui::Frame, app: &mut App) {
             )
         })
         .collect();
-    let para = Paragraph::new(visible).block(detail_block);
+    let para = Paragraph::new(visible)
+        .scroll((0, app.detail_horizontal))
+        .block(detail_block);
     f.render_widget(para, main[1]);
 
     // footer
@@ -510,7 +527,7 @@ pub fn draw(f: &mut ratatui::Frame, app: &mut App) {
     let help = if let Some(msg) = flash {
         format!(" {msg}")
     } else {
-        " j/k move · g/G top/bottom · enter expand · x expand subtree · e collapse to roots · f focus changes · tab pane · q quit "
+        " j/k move · H/L scroll horizontally · g/G top/bottom · enter expand · x expand subtree · e collapse to roots · f focus changes · tab pane · q quit "
             .to_string()
     };
     f.render_widget(
@@ -520,6 +537,33 @@ pub fn draw(f: &mut ratatui::Frame, app: &mut App) {
         ))),
         root[2],
     );
+}
+
+/// Clip by terminal columns while preserving styles and grapheme boundaries.
+fn scroll_line(line: Line<'static>, offset: u16) -> Line<'static> {
+    if offset == 0 {
+        return line;
+    }
+    use unicode_segmentation::UnicodeSegmentation;
+    use unicode_width::UnicodeWidthStr;
+    let mut skip = usize::from(offset);
+    let mut spans = Vec::with_capacity(line.spans.len());
+    for span in line.spans {
+        let mut text = String::new();
+        for grapheme in span.content.graphemes(true) {
+            let width = grapheme.width();
+            if skip > 0 {
+                if width > skip {
+                    text.push_str(&" ".repeat(width - skip));
+                }
+                skip = skip.saturating_sub(width);
+            } else {
+                text.push_str(grapheme);
+            }
+        }
+        spans.push(Span::styled(text, span.style));
+    }
+    Line::from(spans)
 }
 
 pub fn run(app: &mut App) -> anyhow::Result<()> {
@@ -545,6 +589,38 @@ pub fn run(app: &mut App) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn horizontal_scroll_moves_only_focused_panel_content() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let a = analyze("fn target() { let z = 3; }", "fn target() { let z = 4; }");
+        let mut app = target_app(&a);
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let before = terminal.backend().buffer().clone();
+        app.handle_key(KeyCode::Char('L'));
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let after = terminal.backend().buffer();
+        assert_eq!(after[(1, 2)].symbol(), before[(2, 2)].symbol());
+        assert_eq!(after[(46, 2)], before[(46, 2)]);
+        app.handle_key(KeyCode::Tab);
+        app.handle_key(KeyCode::Char('L'));
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        assert_eq!(terminal.backend().buffer()[(46, 2)].symbol(), "a");
+        app.handle_key(KeyCode::Char('H'));
+        app.handle_key(KeyCode::Char('H'));
+        assert_eq!(app.detail_horizontal, 0);
+        assert_eq!(app.tree_horizontal, 1);
+    }
+
+    #[test]
+    fn horizontal_clip_preserves_wide_and_combining_graphemes() {
+        assert_eq!(
+            plain(&scroll_line(Line::from("界e\u{301}x"), 1)),
+            " e\u{301}x"
+        );
+        assert_eq!(plain(&scroll_line(Line::from("界e\u{301}x"), 3)), "x");
+    }
 
     fn analyze(base: &str, head: &str) -> Analysis {
         analysis::analyze(&analysis::Inputs {

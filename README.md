@@ -64,7 +64,9 @@ key. Each node contains `key`, `name`, `file`, `label`, `status` (`added`,
 Keys: `j/k` move · `enter`/`l` toggle expansion · `h` collapse the row or its
 nearest expanded ancestor · `x` expand subtree (depth limit 5) · `e` collapse
 to roots · `f` focus relevant branches · `g/G` first/last row (top/bottom in
-details) · `tab` switch pane · `q` quit. In the detail pane, diff markers are
+details) · `tab` switch pane · `Shift+H`/`Shift+L` scroll the focused panel
+left/right by one column (each panel keeps its own offset) · `q` quit.
+In the detail pane, diff markers are
 `+` added lines, `-` removed lines, and a space for context; base and head line
 numbers refer to their own revisions.
 
