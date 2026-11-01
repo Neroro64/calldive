@@ -228,8 +228,7 @@ fn worktree_is_the_default_head() {
     repo.commit_all("base");
     write_head(&repo);
     repo.commit_all("head");
-    // one more change on top: staged but uncommitted (git diff never sees
-    // untracked files, and that is the reviewer's reality too)
+    // one more change on top: staged but uncommitted
     repo.write(
         "src/audit.rs",
         "pub fn audit(order: &Order) -> bool { order.total == 0 }\n",
@@ -447,4 +446,250 @@ fn csharp_c_and_cpp_review_changes_and_renames() {
         }
         assert!(!out.contains("- legacy"), "{path}: rename reported as removal:\n{out}");
     }
+}
+
+fn assert_fn_prefix(out: &str, glyph: char, name: &str) {
+    let prefix = format!("{glyph} {name} ");
+    assert!(
+        out.lines()
+            .any(|line| line.trim_start().starts_with(&prefix)),
+        "missing function prefix '{prefix}':\n{out}"
+    );
+}
+
+#[test]
+fn file_rename_preserves_function_identity() {
+    let repo = Repo::new("file-rename");
+    repo.write(
+        "src/old.rs",
+        "pub fn run() -> u32 { 1 }\npub fn helper() -> u32 { 2 }\n",
+    );
+    repo.commit_all("base");
+    repo.git(&["mv", "src/old.rs", "src/new.rs"]);
+    repo.commit_all("rename");
+
+    let (code, out, err) = repo.run(&["HEAD~1", "HEAD", "--dump"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(
+        out.contains("fns +0 -0 ~0 >0"),
+        "rename changed functions:\n{out}"
+    );
+}
+
+#[test]
+fn file_rename_with_one_edit_changes_only_that_function() {
+    let repo = Repo::new("file-rename-edit");
+    repo.write("src/old.rs", "pub fn run() -> u32 { helper() + 1 }\npub fn helper() -> u32 { 2 }\npub fn stable() -> u32 { 3 }\n");
+    repo.commit_all("base");
+    repo.git(&["mv", "src/old.rs", "src/new.rs"]);
+    repo.write("src/new.rs", "pub fn run() -> u32 { helper() + 9 }\npub fn helper() -> u32 { 2 }\npub fn stable() -> u32 { 3 }\n");
+    repo.commit_all("rename and edit");
+
+    let (code, out, err) = repo.run(&["HEAD~1", "HEAD", "--dump"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(
+        out.contains("fns +0 -0 ~1 >0"),
+        "rename/edit summary wrong:\n{out}"
+    );
+    assert_fn_prefix(&out, '~', "run");
+}
+
+#[test]
+fn untracked_worktree_file_reports_added_functions() {
+    let repo = Repo::new("untracked");
+    repo.write("src/lib.rs", "pub fn stable() -> u32 { 1 }\n");
+    repo.commit_all("base");
+    repo.write("src/new.rs", "pub fn fresh() -> u32 { 2 }\n");
+
+    let (code, out, err) = repo.run(&["HEAD", "worktree", "--dump"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(
+        out.contains("fns +1 -0 ~0 >0"),
+        "untracked file summary wrong:\n{out}"
+    );
+    assert_fn_prefix(&out, '+', "fresh");
+}
+
+#[test]
+fn non_utf8_worktree_source_is_modified_not_removed() {
+    let repo = Repo::new("non-utf8-worktree");
+    repo.write("src/lib.rs", "pub fn text() -> &'static str { \"cafe\" }\n");
+    repo.commit_all("base");
+    fs::write(
+        repo.root.join("src/lib.rs"),
+        b"pub fn text() -> &'static str { \"caf\xe9\" }\n",
+    )
+    .unwrap();
+
+    let (code, out, err) = repo.run(&["HEAD", "worktree", "--dump"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(
+        out.contains("fns +0 -0 ~1 >0"),
+        "non-UTF-8 file summary wrong:\n{out}"
+    );
+    assert_fn_prefix(&out, '~', "text");
+}
+
+#[test]
+fn non_utf8_commit_source_uses_the_same_lossy_decoding() {
+    let repo = Repo::new("non-utf8-commit");
+    repo.write("src/lib.rs", "pub fn text() -> &'static str { \"cafe\" }\n");
+    repo.commit_all("base");
+    fs::write(
+        repo.root.join("src/lib.rs"),
+        b"pub fn text() -> &'static str { \"caf\xe9\" }\n",
+    )
+    .unwrap();
+    repo.commit_all("head");
+
+    let (code, out, err) = repo.run(&["HEAD~1", "HEAD", "--dump"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(
+        out.contains("fns +0 -0 ~1 >0"),
+        "non-UTF-8 commit summary wrong:\n{out}"
+    );
+    assert_fn_prefix(&out, '~', "text");
+}
+
+#[test]
+fn adding_only_a_utf8_bom_changes_no_functions() {
+    let repo = Repo::new("bom");
+    repo.write("src/lib.rs", "pub fn run() -> u32 { 1 }\n");
+    repo.commit_all("base");
+    fs::write(
+        repo.root.join("src/lib.rs"),
+        b"\xef\xbb\xbfpub fn run() -> u32 { 1 }\n",
+    )
+    .unwrap();
+
+    let (code, out, err) = repo.run(&["HEAD", "worktree", "--dump"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(
+        out.contains("fns +0 -0 ~0 >0"),
+        "BOM changed worktree functions:\n{out}"
+    );
+    repo.commit_all("BOM only");
+    let (code, out, err) = repo.run(&["HEAD~1", "HEAD", "--dump"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(
+        out.contains("fns +0 -0 ~0 >0"),
+        "BOM changed commit functions:\n{out}"
+    );
+}
+
+#[test]
+fn branch_named_like_a_tracked_path_resolves_as_base() {
+    let repo = Repo::new("ambiguous-ref");
+    repo.write("src/base.rs", "pub fn run() -> u32 { 1 }\n");
+    repo.commit_all("base");
+    repo.git(&["branch", "src/base.rs"]);
+    repo.write("src/base.rs", "pub fn run() -> u32 { 2 }\n");
+    repo.commit_all("head");
+
+    let (code, out, err) = repo.run(&["src/base.rs", "HEAD", "--dump"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(
+        out.contains("src/base.rs → HEAD"),
+        "user-facing ref label lost:\n{out}"
+    );
+    assert!(
+        out.contains("fns +0 -0 ~1 >0"),
+        "ambiguous ref summary wrong:\n{out}"
+    );
+    assert_fn_prefix(&out, '~', "run");
+}
+
+#[test]
+fn worktree_is_rejected_as_base() {
+    let repo = Repo::new("worktree-base");
+    repo.write("src/lib.rs", "pub fn run() -> u32 { 1 }\n");
+    repo.commit_all("base");
+
+    let (code, _out, err) = repo.run(&["worktree", "HEAD", "--dump"]);
+    assert_ne!(code, 0);
+    assert!(
+        err.contains("base") && err.contains("worktree") && err.contains("commit revision"),
+        "unclear worktree base error: {err}"
+    );
+}
+
+#[test]
+fn non_ascii_changed_paths_work_in_both_head_modes() {
+    let repo = Repo::new("non-ascii-path");
+    repo.write("src/café.rs", "pub fn run() -> u32 { 1 }\n");
+    repo.commit_all("base");
+    repo.write("src/café.rs", "pub fn run() -> u32 { 2 }\n");
+
+    let (code, out, err) = repo.run(&["HEAD", "worktree", "--dump"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(
+        out.contains("fns +0 -0 ~1 >0"),
+        "non-ASCII worktree summary wrong:\n{out}"
+    );
+    assert_fn_prefix(&out, '~', "run");
+    repo.commit_all("head");
+    let (code, out, err) = repo.run(&["HEAD~1", "HEAD", "--dump"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(
+        out.contains("fns +0 -0 ~1 >0"),
+        "non-ASCII commit summary wrong:\n{out}"
+    );
+    assert_fn_prefix(&out, '~', "run");
+}
+
+#[test]
+fn commit_head_reviews_with_unchanged_caller_candidates() {
+    let repo = Repo::new("commit-candidates");
+    repo.write("src/lib.rs", "pub fn run() -> u32 { 1 }\n");
+    repo.write("src/caller.rs", "pub fn caller() -> u32 { run() }\n");
+    repo.write(
+        "src/prefix.rs",
+        "pub fn rerun() -> u32 { 2 }\npub fn run_all() -> u32 { 3 }\n",
+    );
+    repo.write("src/unrelated.rs", "pub fn unrelated() -> u32 { 4 }\n");
+    repo.write(
+        "src/large.rs",
+        &format!(
+            "// {}\npub fn oversized() -> u32 {{ run() }}\n",
+            "x".repeat(512 * 1024)
+        ),
+    );
+    repo.commit_all("base");
+    repo.write("src/lib.rs", "pub fn run() -> u32 { 9 }\n");
+    repo.commit_all("head");
+
+    let (code, out, err) = repo.run(&["HEAD~1", "HEAD", "--dump"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(
+        out.contains("fns +0 -0 ~1 >0"),
+        "commit candidate summary wrong:\n{out}"
+    );
+    assert_fn_prefix(&out, '~', "run");
+    for name in ["caller", "rerun", "run_all", "unrelated", "oversized"] {
+        for glyph in ['+', '-', '~', '>'] {
+            let prefix = format!("{glyph} {name} ");
+            assert!(
+                !out.lines()
+                    .any(|line| line.trim_start().starts_with(&prefix)),
+                "unchanged candidate reported as changed:\n{out}"
+            );
+        }
+    }
+}
+
+#[test]
+fn copied_file_with_one_edit_reads_the_original_base() {
+    let repo = Repo::new("file-copy-edit");
+    repo.write("src/original.rs", "pub fn run() -> u32 { helper() + 1 }\npub fn helper() -> u32 { 2 }\npub fn stable() -> u32 { 3 }\n");
+    repo.commit_all("base");
+    repo.write("src/copied.rs", "pub fn run() -> u32 { helper() + 9 }\npub fn helper() -> u32 { 2 }\npub fn stable() -> u32 { 3 }\n");
+    repo.commit_all("copy and edit");
+
+    let (code, out, err) = repo.run(&["HEAD~1", "HEAD", "--dump"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(
+        out.contains("fns +0 -0 ~1 >0"),
+        "copy/edit summary wrong:\n{out}"
+    );
+    assert_fn_prefix(&out, '~', "run");
 }

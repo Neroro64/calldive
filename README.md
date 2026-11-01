@@ -7,7 +7,8 @@ one thing a senior reviewer actually needs: **what behavior changed and how it
 flows**. calldive reviews a change the way it executes:
 
 1. Parse the changed files of a git range with tree-sitter (Rust, Python,
-   TypeScript/TSX, JavaScript/JSX, Go, C#, C, C++).
+   TypeScript/TSX, JavaScript/JSX, Go, C#, C, C++). In worktree mode, untracked
+   (non-ignored) files are reviewed as added files.
 2. Build the call graph at both revisions and diff the graphs.
 3. Start at the **entry points** and DFS into callees — every hop shows the
    per-function line diff, its callers, and its callees.
@@ -50,7 +51,13 @@ Keys: `j/k` move · `enter` expand/collapse · `x` expand subtree ·
 ## How it works
 
 - Changed files are parsed at both revisions; symbols are matched by
-  `file::name` identity with whitespace-normalized body hashing.
+  `file::name` identity with whitespace-normalized body hashing. Renamed or
+  copied files are compared against their original path, so a pure file
+  rename reports no function churn.
+- Sources are decoded as UTF-8 with invalid bytes replaced and a leading BOM
+  stripped, identically for working-tree files and git objects.
+- TypeScript uses `.ts`/`.mts`/`.cts`, TSX uses the TSX grammar for `.tsx`,
+  and JavaScript uses `.js`/`.jsx`/`.mjs`/`.cjs`.
 - C# (`.cs`) includes methods, constructors/destructors, local functions,
   and bound lambdas/anonymous delegates. C/C++ includes function definitions,
   methods and templates; declarations/prototypes are not separate symbols.
@@ -61,16 +68,20 @@ Keys: `j/k` move · `enter` expand/collapse · `x` expand subtree ·
   `let f = |x| ...`, JS/TS `const f = (x) => ...`, Python `f = lambda x: ...`,
   Go `f := func() ...`, C# `Func<int> f = () => ...`, C++ `auto f = [] { ... }`),
   so calls through the binding resolve.
-- Test functions (Rust `mod tests` + `tests/` dirs, `*_test.go`,
-  `test_*.py` / `*_test.py`, `*.test.*` / `__tests__`, C# `*Test.cs` / `*Tests.cs`,
-  C/C++ `test_*` / `*_test` / `*_tests`, and C#/C/C++ `tests/` dirs) are hidden
-  by default; `--tests` includes them.
+- Test functions are hidden by default; `--tests` includes them. Conventions:
+  `tests/` dirs (every language except Go; also `test/` for Python and JS/TS), Rust
+  `#[test]`-style attributes and `#[cfg(test)]` modules, `*_test.go`,
+  `test_*.py` / `*_test.py` / `conftest.py`, `*.test.*` / `*.spec.*` /
+  `__tests__`, C# `*Test.cs` / `*Tests.cs` plus `[Fact]`/`[Theory]`/`[Test]`/
+  `[TestMethod]`/`[TestCase]` methods and `[TestFixture]`/`[TestClass]`
+  classes, and C/C++ `test_*` / `*_test` / `*_tests` files.
 - A removed + an added function with identical bodies is reported as a move,
   so renames don't show phantom churn.
 - Call sites resolve by simple name: same-file definition first, then a
   unique repo-wide match. Unresolved calls are shown as `(ext)`.
-- Unchanged files are parsed too (head revision only) so a changed function
-  called from unchanged code is not falsely reported as an entry point.
+- Unchanged files that mention a changed function name are parsed too (head
+  revision only, read through one `git cat-file --batch` process) to find
+  callers outside the diff.
 - Entry points are the top of every changed chain; review order is
   changed-first. File labels disambiguate colliding basenames
   (`crates/core/lib.rs` vs `crates/dap/lib.rs`).

@@ -6,10 +6,10 @@ description = "Interactive TUI code review: entry-point driven, call-graph aware
 license = "MIT"
 
 [dependencies]
+aho-corasick = "1"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 ratatui = "0.29"
-crossterm = "0.28"
 similar = "2"
 tree-sitter = "0.25"
 tree-sitter-rust = "0.23"
