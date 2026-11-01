@@ -1,11 +1,12 @@
 //! Tree-sitter based extraction of function definitions and call sites.
 //!
 //! Language support is intentionally small but covers the big ones:
-//! Rust, Python, TypeScript/TSX, JavaScript/JSX, Go.
+//! Rust, Python, TypeScript/TSX, JavaScript/JSX, Go, C#, C, C++.
 //!
 //! Also captures let-bound closures/lambdas (Rust `let f = |x| ...`,
 //! JS/TS `const f = (x) => ...`, Python `f = lambda x: ...`,
-//! Go `f := func() ...`) as named symbols so calls to the binding resolve.
+//! Go `f := func() ...`, C# `Func<int> f = () => ...`,
+//! C++ `auto f = [] { ... }`) as named symbols so calls to the binding resolve.
 
 use tree_sitter::{Parser, Tree};
 
@@ -16,9 +17,16 @@ pub enum Lang {
     TypeScript,
     JavaScript,
     Go,
+    CSharp,
+    C,
+    Cpp,
 }
 
 pub fn lang_for_path(path: &str) -> Option<Lang> {
+    // Uppercase .C conventionally denotes C++, unlike lowercase .c.
+    if path.ends_with(".C") {
+        return Some(Lang::Cpp);
+    }
     let p = path.to_ascii_lowercase();
     if p.ends_with(".rs") {
         Some(Lang::Rust)
@@ -30,6 +38,28 @@ pub fn lang_for_path(path: &str) -> Option<Lang> {
         Some(Lang::JavaScript)
     } else if p.ends_with(".go") {
         Some(Lang::Go)
+    } else if p.ends_with(".cs") {
+        Some(Lang::CSharp)
+    } else if p.ends_with(".c") {
+        Some(Lang::C)
+    } else if matches!(
+        p.rsplit('.').next(),
+        Some(
+            "h" | "cc"
+                | "cpp"
+                | "cxx"
+                | "c++"
+                | "hh"
+                | "hpp"
+                | "hxx"
+                | "h++"
+                | "ipp"
+                | "inl"
+                | "tpp"
+        )
+    ) {
+        // .h is ambiguous; the C++ grammar also handles ordinary C headers.
+        Some(Lang::Cpp)
     } else {
         None
     }
@@ -66,17 +96,38 @@ pub struct ParsedFile {
 }
 
 /// File-level test convention (independent of AST).
-fn file_is_test_by_convention(path: &str) -> bool {
+fn file_is_test_by_convention(path: &str, lang: Lang) -> bool {
     let p = path.to_ascii_lowercase();
-    let base = p.rsplit('/').next().unwrap_or(&p).to_string();
-    let rust_integration_test =
-        p.ends_with(".rs") && (p.starts_with("tests/") || p.contains("/tests/"));
+    let base = p.rsplit('/').next().unwrap_or(&p);
+    let in_tests = p.starts_with("tests/") || p.contains("/tests/");
+    let language_test = match lang {
+        Lang::Rust => in_tests,
+        Lang::CSharp => {
+            // Match the PascalCase suffix, not words such as Contest/Latest.
+            let original_base = path.rsplit('/').next().unwrap_or(path);
+            let stem = original_base
+                .rsplit_once('.')
+                .map_or(original_base, |(stem, _)| stem);
+            in_tests
+                || matches!(stem, "test" | "tests")
+                || stem.ends_with("Test")
+                || stem.ends_with("Tests")
+        }
+        Lang::C | Lang::Cpp => {
+            let stem = base.rsplit_once('.').map_or(base, |(stem, _)| stem);
+            in_tests
+                || stem.starts_with("test_")
+                || stem.ends_with("_test")
+                || stem.ends_with("_tests")
+        }
+        _ => false,
+    };
     p.ends_with("_test.go")
         || (base.starts_with("test_") && base.ends_with(".py"))
         || base.ends_with("_test.py")
         || base.contains(".test.")
         || p.contains("__tests__/")
-        || rust_integration_test
+        || language_test
 }
 
 pub fn parse_file(path: &str, src: &str) -> Option<ParsedFile> {
@@ -88,6 +139,9 @@ pub fn parse_file(path: &str, src: &str) -> Option<ParsedFile> {
         Lang::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT,
         Lang::JavaScript => tree_sitter_javascript::LANGUAGE,
         Lang::Go => tree_sitter_go::LANGUAGE,
+        Lang::CSharp => tree_sitter_c_sharp::LANGUAGE,
+        Lang::C => tree_sitter_c::LANGUAGE,
+        Lang::Cpp => tree_sitter_cpp::LANGUAGE,
     };
     parser
         .set_language(&language.into())
@@ -97,7 +151,7 @@ pub fn parse_file(path: &str, src: &str) -> Option<ParsedFile> {
         &tree,
         src.as_bytes(),
         lang,
-        file_is_test_by_convention(path),
+        file_is_test_by_convention(path, lang),
     ))
 }
 
@@ -109,17 +163,37 @@ fn extract(tree: &Tree, src: &[u8], lang: Lang, file_is_test: bool) -> ParsedFil
         matches!(
             kind,
             "function_item"                    // rust
-                | "function_definition"        // python
+                | "function_definition"        // python/c/c++
                 | "function_declaration"       // ts/js/go
                 | "generator_function_declaration" // js
                 | "method_definition"          // ts/js
-                | "method_declaration" // go
+                | "method_declaration"         // go/c#
+                | "constructor_declaration"    // c#
+                | "destructor_declaration"     // c#
+                | "local_function_statement" // c#
         )
     }
 
     /// let-bound closure/lambda binding name, if this node declares one.
-    fn binding_name(node: tree_sitter::Node, lang: Lang, src: &[u8]) -> Option<String> {
+    fn binding_name(node: tree_sitter::Node, lang: Lang) -> Option<tree_sitter::Node> {
         let kind = node.kind();
+        if lang == Lang::C {
+            return None;
+        }
+        // C# variable initializers are unnamed children, not a `value` field.
+        if lang == Lang::CSharp {
+            if kind != "variable_declarator" {
+                return None;
+            }
+            let mut cursor = node.walk();
+            node.named_children(&mut cursor).find(|n| {
+                matches!(
+                    unparenthesized(*n).kind(),
+                    "lambda_expression" | "anonymous_method_expression"
+                )
+            })?;
+            return node.child_by_field_name("name");
+        }
         let mut value = node
             .child_by_field_name("value")
             .or_else(|| node.child_by_field_name("right"))?;
@@ -130,6 +204,9 @@ fn extract(tree: &Tree, src: &[u8], lang: Lang, file_is_test: bool) -> ParsedFil
                 return None;
             }
             value = c.node();
+        }
+        if lang == Lang::Cpp {
+            value = unparenthesized(value);
         }
         let value_kind = value.kind();
         let is_closure = match lang {
@@ -143,21 +220,27 @@ fn extract(tree: &Tree, src: &[u8], lang: Lang, file_is_test: bool) -> ParsedFil
                         "arrow_function" | "function_expression" | "function"
                     )
             }
+            Lang::CSharp => unreachable!(),
+            Lang::C => false,
+            Lang::Cpp => kind == "init_declarator" && value_kind == "lambda_expression",
         };
         if !is_closure {
             return None;
+        }
+        if lang == Lang::Cpp {
+            return declarator_name(node.child_by_field_name("declarator")?);
         }
         if matches!(lang, Lang::Python) {
             // assignment: `left` is the target (identifier or pattern list)
             let left = node.child_by_field_name("left")?;
             if left.kind() == "identifier" {
-                return left.utf8_text(src).ok().map(String::from);
+                return Some(left);
             }
             let mut c = left.walk();
             if c.goto_first_child() {
                 loop {
                     if c.node().kind() == "identifier" {
-                        return c.node().utf8_text(src).ok().map(String::from);
+                        return Some(c.node());
                     }
                     if !c.goto_next_sibling() {
                         break;
@@ -183,7 +266,7 @@ fn extract(tree: &Tree, src: &[u8], lang: Lang, file_is_test: bool) -> ParsedFil
         } else {
             name_node
         };
-        name_node.utf8_text(src).ok().map(|s| s.to_string())
+        Some(name_node)
     }
 
     // Recursive walk tracking the innermost enclosing function and whether
@@ -213,18 +296,32 @@ fn extract(tree: &Tree, src: &[u8], lang: Lang, file_is_test: bool) -> ParsedFil
 
         let is_test_here = file_is_test || child_in_test_mod;
 
-        if is_fn_def(kind) {
-            if let Some(name) = node
-                .child_by_field_name("name")
-                .and_then(|n| n.utf8_text(src).ok())
-                .map(|s| s.to_string())
-            {
+        if is_fn_def(kind) && (lang != Lang::CSharp || node.child_by_field_name("body").is_some()) {
+            let name_node = if matches!(lang, Lang::C | Lang::Cpp) {
+                node.child_by_field_name("declarator")
+                    .and_then(declarator_name)
+            } else {
+                node.child_by_field_name("name")
+            };
+            if let Some(name_node) = name_node {
+                let Some(name) = name_node.utf8_text(src).ok() else {
+                    return;
+                };
+                let name = if kind == "destructor_declaration" {
+                    format!("~{name}")
+                } else {
+                    name.to_string()
+                };
                 let idx = out.fns.len();
                 out.fns.push(FnDef {
                     name,
                     start_row: node.start_position().row,
                     end_row: node.end_position().row + 1,
-                    body_hash: hash_excluding(node, src, &["name"]),
+                    body_hash: if matches!(lang, Lang::C | Lang::Cpp) {
+                        hash_without_name(node, name_node, src)
+                    } else {
+                        hash_excluding(node, src, &["name"])
+                    },
                     is_test: is_test_here,
                 });
                 recurse_children(
@@ -241,13 +338,17 @@ fn extract(tree: &Tree, src: &[u8], lang: Lang, file_is_test: bool) -> ParsedFil
         }
 
         // let-bound closure/lambda as a named symbol
-        if let Some(name) = binding_name(node, lang, src) {
+        if let Some(name_node) = binding_name(node, lang) {
             let idx = out.fns.len();
             out.fns.push(FnDef {
-                name,
+                name: name_node.utf8_text(src).unwrap_or_default().to_string(),
                 start_row: node.start_position().row,
                 end_row: node.end_position().row + 1,
-                body_hash: hash_excluding(node, src, &["pattern", "targets", "left", "name"]),
+                body_hash: if lang == Lang::Cpp {
+                    hash_without_name(node, name_node, src)
+                } else {
+                    hash_excluding(node, src, &["pattern", "targets", "left", "name"])
+                },
                 is_test: is_test_here,
             });
             recurse_children(
@@ -322,13 +423,17 @@ fn is_call(kind: &str) -> bool {
         "call_expression"        // rust/js/ts/go
             | "generic_function" // rust turbofish
             | "call" // python
+            | "invocation_expression" // c#
+            | "object_creation_expression" // c# constructors
+            | "new_expression" // c++ constructors
     )
 }
 
 /// Extract the simple callee name from a call node's function expression.
 fn callee_name(call: tree_sitter::Node, src: &[u8]) -> Option<String> {
-    // every supported grammar names the callee field "function"
-    let expr = call.child_by_field_name("function")?;
+    let expr = call
+        .child_by_field_name("function")
+        .or_else(|| call.child_by_field_name("type"))?;
     simple_name(expr, src)
 }
 
@@ -339,7 +444,10 @@ fn simple_name(expr: tree_sitter::Node, src: &[u8]) -> Option<String> {
         "identifier"
         | "property_identifier"
         | "field_identifier"
-        | "shorthand_property_identifier" => expr.utf8_text(src).ok().map(|s| s.to_string()),
+        | "shorthand_property_identifier"
+        | "type_identifier"
+        | "destructor_name"
+        | "operator_name" => expr.utf8_text(src).ok().map(|s| s.to_string()),
         "parenthesized_expression" => {
             let mut inner = None;
             let mut c = expr.walk();
@@ -356,6 +464,13 @@ fn simple_name(expr: tree_sitter::Node, src: &[u8]) -> Option<String> {
             }
             inner.and_then(|n| simple_name(n, src))
         }
+        "generic_name" => expr.named_child(0).and_then(|n| simple_name(n, src)),
+        "template_function" | "template_method" | "template_type" | "dependent_name" => expr
+            .child_by_field_name("name")
+            .and_then(|n| simple_name(n, src)),
+        "pointer_expression" => expr
+            .child_by_field_name("argument")
+            .and_then(|n| simple_name(n, src)),
         "generic_function" => {
             // rust: function field holds the base expression
             expr.child_by_field_name("function")
@@ -366,7 +481,13 @@ fn simple_name(expr: tree_sitter::Node, src: &[u8]) -> Option<String> {
         | "attribute"
         | "selector_expression"
         | "scoped_identifier"
-        | "member_expression" => {
+        | "qualified_identifier"
+        | "member_expression"
+        | "member_access_expression"
+        | "member_binding_expression"
+        | "conditional_access_expression"
+        | "qualified_name"
+        | "alias_qualified_name" => {
             let mut last = None;
             let mut c = expr.walk();
             if c.goto_first_child() {
@@ -383,6 +504,61 @@ fn simple_name(expr: tree_sitter::Node, src: &[u8]) -> Option<String> {
         }
         _ => None,
     }
+}
+
+fn unparenthesized(mut node: tree_sitter::Node) -> tree_sitter::Node {
+    while node.kind() == "parenthesized_expression" {
+        match node.named_child(0) {
+            Some(inner) => node = inner,
+            None => break,
+        }
+    }
+    node
+}
+
+/// Follow only the declarator spine, never identifiers in parameters or types.
+fn declarator_name(node: tree_sitter::Node) -> Option<tree_sitter::Node> {
+    match node.kind() {
+        "identifier" | "field_identifier" | "type_identifier" | "destructor_name"
+        | "operator_name" => Some(node),
+        "qualified_identifier" | "template_function" | "template_method" | "dependent_name" => {
+            node.child_by_field_name("name").and_then(declarator_name)
+        }
+        "parenthesized_declarator" | "reference_declarator" => {
+            node.named_child(0).and_then(declarator_name)
+        }
+        _ => node
+            .child_by_field_name("declarator")
+            .and_then(declarator_name),
+    }
+}
+
+/// C/C++ names sit inside nested declarators. Retain the entire signature
+/// while omitting only the name, so renames match but signature edits do not.
+fn hash_without_name(node: tree_sitter::Node, name: tree_sitter::Node, src: &[u8]) -> u64 {
+    // The tilde distinguishes a destructor from a constructor, not its name.
+    let name_start = name.start_byte() + usize::from(name.kind() == "destructor_name");
+    let before = std::str::from_utf8(&src[node.start_byte()..name_start]).unwrap_or_default();
+    let after = std::str::from_utf8(&src[name.end_byte()..node.end_byte()]).unwrap_or_default();
+    let mut h = 0xcbf29ce484222325u64;
+    let mut started = false;
+    let mut pending_ws = false;
+    for ch in before.chars().chain(after.chars()) {
+        if ch.is_whitespace() {
+            pending_ws = started;
+            continue;
+        }
+        if pending_ws {
+            h = (h ^ u64::from(b' ')).wrapping_mul(0x100000001b3);
+            pending_ws = false;
+        }
+        let mut bytes = [0; 4];
+        for &b in ch.encode_utf8(&mut bytes).as_bytes() {
+            h = (h ^ u64::from(b)).wrapping_mul(0x100000001b3);
+        }
+        started = true;
+    }
+    h
 }
 
 /// Hash the node's children except the given identifying fields,
@@ -545,6 +721,169 @@ mod tests {
     }
 
     #[test]
+    fn csharp_methods_constructors_and_nested_callables() {
+        let src = r#"
+interface IWorker { int Missing(); }
+abstract class Base { public abstract int Absent(); }
+class Worker {
+    public Worker() { Setup(); }
+    ~Worker() { Cleanup(); }
+    int Helper(int x) => x + 1;
+    int Run() {
+        int Local(int x) => Helper(x);
+        Func<int, int> twice = (x => Local(x));
+        Func<int> fallback = delegate { return Helper(0); };
+        receiver?.Send<int>(twice(2));
+        Worker.Create<string>();
+        var worker = new Worker();
+        return fallback();
+    }
+}
+"#;
+        let pf = parse_file("Worker.cs", src).unwrap();
+        let names: Vec<_> = pf.fns.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["Worker", "~Worker", "Helper", "Run", "Local", "twice", "fallback"]
+        );
+        let calls: Vec<_> = pf
+            .calls
+            .iter()
+            .map(|c| (pf.fns[c.caller].name.as_str(), c.name.as_str()))
+            .collect();
+        assert_eq!(
+            calls,
+            [
+                ("Worker", "Setup"),
+                ("~Worker", "Cleanup"),
+                ("Local", "Helper"),
+                ("twice", "Local"),
+                ("fallback", "Helper"),
+                ("Run", "Send"),
+                ("Run", "twice"),
+                ("Run", "Create"),
+                ("Run", "Worker"),
+                ("Run", "fallback"),
+            ]
+        );
+        let run = &pf.fns[3];
+        assert!(src
+            .lines()
+            .nth(run.start_row)
+            .unwrap()
+            .contains("int Run()"));
+        assert_eq!(src.lines().nth(run.end_row - 1).unwrap().trim(), "}");
+    }
+
+    #[test]
+    fn c_definitions_follow_nested_declarators_and_ignore_prototypes() {
+        let src = r#"
+int forward(int value);
+int helper(int value) { return value + 1; }
+char *pointer(void) { return external(); }
+int (*factory(void))(int) { return helper; }
+int run(int (*callback)(int)) {
+    return helper(callback(2)) + (*callback)(3);
+}
+"#;
+        let pf = parse_file("app.c", src).unwrap();
+        let names: Vec<_> = pf.fns.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["helper", "pointer", "factory", "run"]);
+        let calls: Vec<_> = pf
+            .calls
+            .iter()
+            .map(|c| (pf.fns[c.caller].name.as_str(), c.name.as_str()))
+            .collect();
+        assert_eq!(
+            calls,
+            [
+                ("pointer", "external"),
+                ("run", "helper"),
+                ("run", "callback"),
+                ("run", "callback"),
+            ]
+        );
+    }
+
+    #[test]
+    fn cpp_headers_methods_templates_and_bound_lambdas() {
+        let src = r#"
+namespace api {
+    template<typename T> T helper(T x) { return x + 1; }
+}
+struct Worker {
+    Worker() { init(); }
+    ~Worker() { cleanup(); }
+    int run();
+    int operator()(int x) { return api::helper<int>(x); }
+};
+int &reference() { return value; }
+int Worker::run() {
+    auto twice = ([](int x) { return api::helper<int>(x); });
+    worker->send<int>(twice(2));
+    auto other = new Worker();
+    return (*callback)(3);
+}
+"#;
+        let pf = parse_file("worker.h", src).unwrap();
+        let names: Vec<_> = pf.fns.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "helper",
+                "Worker",
+                "~Worker",
+                "operator()",
+                "reference",
+                "run",
+                "twice"
+            ]
+        );
+        let calls: Vec<_> = pf
+            .calls
+            .iter()
+            .map(|c| (pf.fns[c.caller].name.as_str(), c.name.as_str()))
+            .collect();
+        assert_eq!(
+            calls,
+            [
+                ("Worker", "init"),
+                ("~Worker", "cleanup"),
+                ("operator()", "helper"),
+                ("twice", "helper"),
+                ("run", "send"),
+                ("run", "twice"),
+                ("run", "Worker"),
+                ("run", "callback"),
+            ]
+        );
+    }
+
+    #[test]
+    fn native_renames_preserve_hashes_but_signature_changes_do_not() {
+        for (path, source) in [
+            ("app.c", "int *old(int x) { return helper(x); }"),
+            ("app.cpp", "int &Worker::old(int x) { return helper(x); }"),
+            ("app.C", "auto old = [](int x) { return helper(x); };"),
+            ("app.cs", "class App { int old(int x) => helper(x); }"),
+        ] {
+            let base = parse_file(path, source).unwrap();
+            let renamed = parse_file(path, &source.replace("old", "renamed")).unwrap();
+            assert_eq!(base.fns[0].name, "old", "{path}");
+            assert_eq!(renamed.fns[0].name, "renamed", "{path}");
+            assert_eq!(base.fns[0].body_hash, renamed.fns[0].body_hash, "{path}");
+            let changed = parse_file(path, &source.replace("int x", "long x")).unwrap();
+            assert_ne!(base.fns[0].body_hash, changed.fns[0].body_hash, "{path}");
+        }
+        let methods =
+            parse_file("worker.cpp", "struct Worker { Worker() {} ~Worker() {} };").unwrap();
+        assert_ne!(
+            methods.fns[0].body_hash, methods.fns[1].body_hash,
+            "a constructor becoming a destructor is not a pure rename"
+        );
+    }
+
+    #[test]
     fn file_convention_test_detection() {
         let pf = parse_file("tests/it.rs", "fn a() {}\n").unwrap(); // rust integration test dir
         assert!(pf.fns[0].is_test);
@@ -556,5 +895,31 @@ mod tests {
         assert!(pf.fns[0].is_test);
         let pf = parse_file("src/app.test.ts", "function a() {}\n").unwrap();
         assert!(pf.fns[0].is_test);
+        for (path, production, source) in [
+            (
+                "WorkerTests.cs",
+                "Worker.cs",
+                "class Worker { void Run() {} }",
+            ),
+            (
+                "tests/worker.cs",
+                "src/worker.cs",
+                "class Worker { void Run() {} }",
+            ),
+            ("test_worker.c", "worker.c", "void run(void) {}"),
+            ("worker_test.cpp", "worker.cpp", "void run() {}"),
+            ("tests/worker.hpp", "src/worker.hpp", "inline void run() {}"),
+        ] {
+            assert!(parse_file(path, source).unwrap().fns[0].is_test, "{path}");
+            assert!(
+                !parse_file(production, source).unwrap().fns[0].is_test,
+                "{production}"
+            );
+        }
+        let contest = parse_file("Contest.cs", "class Contest { void Run() {} }").unwrap();
+        assert!(
+            !contest.fns[0].is_test,
+            "production names ending in lowercase 'test' stay visible"
+        );
     }
 }

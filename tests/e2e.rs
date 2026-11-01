@@ -411,3 +411,40 @@ pub struct Order {{ pub total: u32 }}
         "--all must add the clean root: {all_roots}"
     );
 }
+
+#[test]
+fn csharp_c_and_cpp_review_changes_and_renames() {
+    for (path, source) in [
+        ("src/app.cs", "class App {\nstatic int helper(int x) { return x + 1; }\nstatic int legacy() { return 7; }\nstatic int run() { return helper(1) + legacy(); }\n// EXTRA\n}\n"),
+        ("src/app.c", "int helper(int x) { return x + 1; }\nint legacy(void) { return 7; }\nint run(void) { return helper(1) + legacy(); }\n// EXTRA\n"),
+        ("src/app.cpp", "namespace app {\ntemplate<typename T> T helper(T x) { return x + 1; }\nint legacy() { return 7; }\nint run() { return helper<int>(1) + legacy(); }\n// EXTRA\n}\n"),
+    ] {
+        let repo = Repo::new(path.rsplit('/').next().unwrap());
+        repo.write(path, source);
+        repo.commit_all("base");
+        let added = if path.ends_with(".cs") {
+            "static int added() { return 9; }"
+        } else {
+            "int added() { return 9; }"
+        };
+        let head = source.replace("x + 1", "x + 2")
+            .replace("legacy", "renamed")
+            .replace("+ renamed();", "+ renamed() + added();")
+            .replace("// EXTRA", added);
+        repo.write(path, &head);
+        repo.commit_all("head");
+
+        let (code, out, err) = repo.run(&["HEAD~1", "HEAD", "--dump", "-e", "run"]);
+        assert_eq!(code, 0, "{path}: {err}");
+        for (name, status) in [("run", '~'), ("helper", '~'), ("renamed", '>'), ("added", '+')] {
+            let line = out.lines().find(|line| line.contains(&format!("{status} {name}")))
+                .unwrap_or_else(|| panic!("{path}: missing {status} {name}:\n{out}"));
+            if name == "run" {
+                assert!(!line.starts_with(' '), "{path}: root was nested: {line}");
+            } else {
+                assert!(line.starts_with("  ") && !line.starts_with("    "), "{path}: callee not nested under run: {line}");
+            }
+        }
+        assert!(!out.contains("- legacy"), "{path}: rename reported as removal:\n{out}");
+    }
+}

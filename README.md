@@ -7,7 +7,7 @@ one thing a senior reviewer actually needs: **what behavior changed and how it
 flows**. calldive reviews a change the way it executes:
 
 1. Parse the changed files of a git range with tree-sitter (Rust, Python,
-   TypeScript/TSX, JavaScript/JSX, Go).
+   TypeScript/TSX, JavaScript/JSX, Go, C#, C, C++).
 2. Build the call graph at both revisions and diff the graphs.
 3. Start at the **entry points** and DFS into callees — every hop shows the
    per-function line diff, its callers, and its callees.
@@ -51,12 +51,20 @@ Keys: `j/k` move · `enter` expand/collapse · `x` expand subtree ·
 
 - Changed files are parsed at both revisions; symbols are matched by
   `file::name` identity with whitespace-normalized body hashing.
+- C# (`.cs`) includes methods, constructors/destructors, local functions,
+  and bound lambdas/anonymous delegates. C/C++ includes function definitions,
+  methods and templates; declarations/prototypes are not separate symbols.
+- C uses `.c`; C++ uses `.C`, `.cc`, `.cpp`, `.cxx`, `.c++`, `.h`, `.hh`,
+  `.hpp`, `.hxx`, `.h++`, `.ipp`, `.inl`, and `.tpp`. Ambiguous `.h` headers
+  use the C++ grammar, which also handles ordinary C header definitions.
 - Let-bound closures/lambdas are captured as named symbols (Rust
   `let f = |x| ...`, JS/TS `const f = (x) => ...`, Python `f = lambda x: ...`,
-  Go `f := func() ...`), so calls through the binding resolve.
+  Go `f := func() ...`, C# `Func<int> f = () => ...`, C++ `auto f = [] { ... }`),
+  so calls through the binding resolve.
 - Test functions (Rust `mod tests` + `tests/` dirs, `*_test.go`,
-  `test_*.py` / `*_test.py`, `*.test.*` / `__tests__`) are hidden by
-  default; `--tests` includes them.
+  `test_*.py` / `*_test.py`, `*.test.*` / `__tests__`, C# `*Test.cs` / `*Tests.cs`,
+  C/C++ `test_*` / `*_test` / `*_tests`, and C#/C/C++ `tests/` dirs) are hidden
+  by default; `--tests` includes them.
 - A removed + an added function with identical bodies is reported as a move,
   so renames don't show phantom churn.
 - Call sites resolve by simple name: same-file definition first, then a
@@ -71,6 +79,12 @@ Keys: `j/k` move · `enter` expand/collapse · `x` expand subtree ·
 
 - Name-based call resolution: no type inference, so dynamic dispatch,
   interface fan-out, and same-name methods resolve heuristically or not at all.
+- Symbols use `file::name` identities: overloads and same-name methods within
+  one file collapse to a single symbol. C/C++ macros are not expanded, and
+  implicit or type-dependent calls are not resolved.
+- C# property/accessor bodies and operator declarations are not extracted;
+  calls outside a named function (including top-level statements) are not
+  modeled.
 - Only *let-bound* closures are named symbols; closures passed inline as
   arguments (`.map(|x| ...)`) are attributed to the enclosing function.
 - Removed functions keep their base-revision callees but no base callers

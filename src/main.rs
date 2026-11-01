@@ -99,7 +99,7 @@ fn main() -> Result<()> {
         files.push((ch.path.clone(), base_src, head_src));
     }
     if files.is_empty() {
-        println!("changed files, but none in a supported language (rs, py, ts/tsx, js/jsx, go)");
+        println!("changed files, but none in a supported language (Rust, Python, TypeScript/TSX, JavaScript/JSX, Go, C#, C, C++)");
         return Ok(());
     }
 
