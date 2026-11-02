@@ -78,6 +78,18 @@ impl Drop for Repo {
     }
 }
 
+fn assert_summary(repo: &Repo, base: &str, head: &str, counts: (usize, usize, usize, usize)) {
+    let (code, out, err) = repo.run(&[base, head, "--json"]);
+    assert_eq!(code, 0, "{err}");
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        value["summary"],
+        serde_json::json!({
+            "added": counts.0, "removed": counts.1, "changed": counts.2, "moved": counts.3,
+        })
+    );
+}
+
 /// Base lib.rs + unchanged jobs.rs, committed once.
 fn write_base(repo: &Repo) {
     repo.write(
@@ -152,10 +164,7 @@ fn full_review_tree_statuses_and_structure() {
 
     // summary counts: +2 (assess_risk, flag_for_review) -2 (legacy_check, skip)
     // ~2 (process, validate) >1 (charge→charge_back rename)
-    assert!(
-        out.contains("fns +2 -2 ~2 >1"),
-        "summary line wrong:\n{out}"
-    );
+    assert_summary(&repo, "HEAD~1", "HEAD", (2, 2, 2, 1));
 
     // process is the top root (body changed sorts first) even though
     // retry_all in unchanged jobs.rs calls it
@@ -376,39 +385,21 @@ pub struct Order {{ pub total: u32 }}
     repo.write("src/lib.rs", &lib("flagged!"));
     repo.commit_all("head");
 
-    // default: only the changed chain's root (process) is listed
-    let (code, out, _) = repo.run(&["HEAD~1", "HEAD", "--dump"]);
-    assert_eq!(code, 0);
-    let default_roots = out
-        .lines()
-        .find(|l| l.contains("entry points:"))
-        .unwrap()
-        .to_string();
-    // --all adds the clean unused_helper root
-    let (code, out_all, _) = repo.run(&["HEAD~1", "HEAD", "--all", "--dump"]);
-    assert_eq!(code, 0);
-    let all_roots = out_all
-        .lines()
-        .find(|l| l.contains("entry points:"))
-        .unwrap()
-        .to_string();
-    assert!(
-        out_all.contains("unused_helper"),
-        "clean root missing:\n{out_all}"
-    );
-
-    let n = |s: &str| -> usize { s.rsplit(':').next().unwrap().trim().parse().unwrap_or(0) };
-    assert!(n(&default_roots) >= 1);
-    assert_eq!(
-        n(&default_roots),
-        1,
-        "default should be 1 root: {default_roots}"
-    );
-    assert_eq!(
-        n(&all_roots),
-        2,
-        "--all must add the clean root: {all_roots}"
-    );
+    let (code, out, err) = repo.run(&["HEAD~1", "HEAD", "--json"]);
+    assert_eq!(code, 0, "{err}");
+    let default: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(default["roots"], serde_json::json!(["src/lib.rs::process"]));
+    let (code, out, err) = repo.run(&["HEAD~1", "HEAD", "--all", "--json"]);
+    assert_eq!(code, 0, "{err}");
+    let all: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let roots = all["roots"].as_array().unwrap();
+    for key in [
+        "src/lib.rs::process",
+        "src/lib.rs::unused_helper",
+        "src/lib.rs::Order",
+    ] {
+        assert!(roots.contains(&serde_json::json!(key)), "{all}");
+    }
 }
 
 #[test]
@@ -473,12 +464,7 @@ fn file_rename_preserves_function_identity() {
     repo.git(&["mv", "src/old.rs", "src/new.rs"]);
     repo.commit_all("rename");
 
-    let (code, out, err) = repo.run(&["HEAD~1", "HEAD", "--dump"]);
-    assert_eq!(code, 0, "stderr: {err}");
-    assert!(
-        out.contains("fns +0 -0 ~0 >0"),
-        "rename changed functions:\n{out}"
-    );
+    assert_summary(&repo, "HEAD~1", "HEAD", (0, 0, 0, 0));
 }
 
 #[test]
@@ -492,10 +478,7 @@ fn file_rename_with_one_edit_changes_only_that_function() {
 
     let (code, out, err) = repo.run(&["HEAD~1", "HEAD", "--dump"]);
     assert_eq!(code, 0, "stderr: {err}");
-    assert!(
-        out.contains("fns +0 -0 ~1 >0"),
-        "rename/edit summary wrong:\n{out}"
-    );
+    assert_summary(&repo, "HEAD~1", "HEAD", (0, 0, 1, 0));
     assert_fn_prefix(&out, '~', "run");
 }
 
@@ -508,10 +491,7 @@ fn untracked_worktree_file_reports_added_functions() {
 
     let (code, out, err) = repo.run(&["HEAD", "worktree", "--dump"]);
     assert_eq!(code, 0, "stderr: {err}");
-    assert!(
-        out.contains("fns +1 -0 ~0 >0"),
-        "untracked file summary wrong:\n{out}"
-    );
+    assert_summary(&repo, "HEAD", "worktree", (1, 0, 0, 0));
     assert_fn_prefix(&out, '+', "fresh");
 }
 
@@ -528,10 +508,7 @@ fn non_utf8_worktree_source_is_modified_not_removed() {
 
     let (code, out, err) = repo.run(&["HEAD", "worktree", "--dump"]);
     assert_eq!(code, 0, "stderr: {err}");
-    assert!(
-        out.contains("fns +0 -0 ~1 >0"),
-        "non-UTF-8 file summary wrong:\n{out}"
-    );
+    assert_summary(&repo, "HEAD", "worktree", (0, 0, 1, 0));
     assert_fn_prefix(&out, '~', "text");
 }
 
@@ -549,10 +526,7 @@ fn non_utf8_commit_source_uses_the_same_lossy_decoding() {
 
     let (code, out, err) = repo.run(&["HEAD~1", "HEAD", "--dump"]);
     assert_eq!(code, 0, "stderr: {err}");
-    assert!(
-        out.contains("fns +0 -0 ~1 >0"),
-        "non-UTF-8 commit summary wrong:\n{out}"
-    );
+    assert_summary(&repo, "HEAD~1", "HEAD", (0, 0, 1, 0));
     assert_fn_prefix(&out, '~', "text");
 }
 
@@ -567,19 +541,9 @@ fn adding_only_a_utf8_bom_changes_no_functions() {
     )
     .unwrap();
 
-    let (code, out, err) = repo.run(&["HEAD", "worktree", "--dump"]);
-    assert_eq!(code, 0, "stderr: {err}");
-    assert!(
-        out.contains("fns +0 -0 ~0 >0"),
-        "BOM changed worktree functions:\n{out}"
-    );
+    assert_summary(&repo, "HEAD", "worktree", (0, 0, 0, 0));
     repo.commit_all("BOM only");
-    let (code, out, err) = repo.run(&["HEAD~1", "HEAD", "--dump"]);
-    assert_eq!(code, 0, "stderr: {err}");
-    assert!(
-        out.contains("fns +0 -0 ~0 >0"),
-        "BOM changed commit functions:\n{out}"
-    );
+    assert_summary(&repo, "HEAD~1", "HEAD", (0, 0, 0, 0));
 }
 
 #[test]
@@ -597,10 +561,7 @@ fn branch_named_like_a_tracked_path_resolves_as_base() {
         out.contains("src/base.rs → HEAD"),
         "user-facing ref label lost:\n{out}"
     );
-    assert!(
-        out.contains("fns +0 -0 ~1 >0"),
-        "ambiguous ref summary wrong:\n{out}"
-    );
+    assert_summary(&repo, "src/base.rs", "HEAD", (0, 0, 1, 0));
     assert_fn_prefix(&out, '~', "run");
 }
 
@@ -627,18 +588,12 @@ fn non_ascii_changed_paths_work_in_both_head_modes() {
 
     let (code, out, err) = repo.run(&["HEAD", "worktree", "--dump"]);
     assert_eq!(code, 0, "stderr: {err}");
-    assert!(
-        out.contains("fns +0 -0 ~1 >0"),
-        "non-ASCII worktree summary wrong:\n{out}"
-    );
+    assert_summary(&repo, "HEAD", "worktree", (0, 0, 1, 0));
     assert_fn_prefix(&out, '~', "run");
     repo.commit_all("head");
     let (code, out, err) = repo.run(&["HEAD~1", "HEAD", "--dump"]);
     assert_eq!(code, 0, "stderr: {err}");
-    assert!(
-        out.contains("fns +0 -0 ~1 >0"),
-        "non-ASCII commit summary wrong:\n{out}"
-    );
+    assert_summary(&repo, "HEAD~1", "HEAD", (0, 0, 1, 0));
     assert_fn_prefix(&out, '~', "run");
 }
 
@@ -665,10 +620,7 @@ fn commit_head_reviews_with_unchanged_caller_candidates() {
 
     let (code, out, err) = repo.run(&["HEAD~1", "HEAD", "--dump"]);
     assert_eq!(code, 0, "stderr: {err}");
-    assert!(
-        out.contains("fns +0 -0 ~1 >0"),
-        "commit candidate summary wrong:\n{out}"
-    );
+    assert_summary(&repo, "HEAD~1", "HEAD", (0, 0, 1, 0));
     assert_fn_prefix(&out, '~', "run");
     for name in ["caller", "rerun", "run_all", "unrelated", "oversized"] {
         for glyph in ['+', '-', '~', '>'] {
@@ -692,10 +644,7 @@ fn copied_file_with_one_edit_reads_the_original_base() {
 
     let (code, out, err) = repo.run(&["HEAD~1", "HEAD", "--dump"]);
     assert_eq!(code, 0, "stderr: {err}");
-    assert!(
-        out.contains("fns +0 -0 ~1 >0"),
-        "copy/edit summary wrong:\n{out}"
-    );
+    assert_summary(&repo, "HEAD~1", "HEAD", (0, 0, 1, 0));
     assert_fn_prefix(&out, '~', "run");
 }
 
@@ -903,4 +852,332 @@ fn tsx_function_after_jsx_has_its_own_body() {
     assert_eq!(code, 0, "{err}");
     assert_fn_prefix(&out, '~', "go");
     assert!(!out.contains("~ App"), "{out}");
+}
+
+#[test]
+fn contract_rename_with_signature_and_body_edits_keeps_history_and_dispatch() {
+    let repo = Repo::new("contract-rename-edit");
+    let base = "interface IWorker { int Run(int x); }\nabstract class Base : IWorker { public abstract int Run(int x); }\nclass Worker : Base { public override int Run(int x) { return x + 1; } }\nclass Unrelated { public int Execute(int x) { return 99; } }\nclass App { int Start(IWorker worker) { return worker.Run(1); } }\n";
+    repo.write("src/worker.cs", base);
+    repo.commit_all("base");
+    repo.write(
+        "src/worker.cs",
+        &base
+            .replace("int Run(int x)", "long Execute(long x)")
+            .replace("worker.Run(1)", "worker.Execute(1)")
+            .replace("x + 1", "x + 2"),
+    );
+    let (code, out, err) = repo.run(&["HEAD", "--json"]);
+    assert_eq!(code, 0, "{err}");
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let nodes = value["nodes"].as_array().unwrap();
+    for owner in ["IWorker", "Base", "Worker"] {
+        let name = format!("{owner}::Execute");
+        let symbol = nodes.iter().find(|n| n["name"] == name).unwrap();
+        assert_eq!(symbol["status"], "changed", "{symbol}");
+        assert_eq!(symbol["moved_from"], format!("{owner}::Run"));
+        assert!(symbol["base"].is_object(), "{symbol}");
+    }
+    assert!(
+        !nodes
+            .iter()
+            .any(|n| n["name"].as_str().unwrap().ends_with("::Run")),
+        "{out}"
+    );
+    let start = nodes.iter().find(|n| n["name"] == "App::Start").unwrap();
+    let callees = start["callees"].as_array().unwrap();
+    assert!(
+        callees.contains(&serde_json::json!("src/worker.cs::IWorker::Execute")),
+        "{start}"
+    );
+    assert!(
+        callees.contains(&serde_json::json!("src/worker.cs::Worker::Execute")),
+        "{start}"
+    );
+    assert!(
+        !callees.contains(&serde_json::json!("src/worker.cs::Unrelated::Execute")),
+        "{start}"
+    );
+}
+
+#[test]
+fn interface_only_edit_includes_unchanged_transitive_implementation_context() {
+    let repo = Repo::new("contract-context");
+    repo.write("src/contract.cs", "interface IWorker { int Run(int x); }\n");
+    repo.write(
+        "src/base.cs",
+        "abstract class Base : IWorker { public abstract int Run(int x); }\n",
+    );
+    repo.write(
+        "src/worker.cs",
+        "class Worker : Base { public override int Run(int value) { return value; } }\n",
+    );
+    repo.write("src/leaf.cs", "class Leaf : Worker {}\n");
+    repo.write(
+        "src/app.cs",
+        "class App { int Start(IWorker worker) { return worker.Run(1); } }\n",
+    );
+    repo.write(
+        "src/unrelated.cs",
+        "class Unrelated { int Run(int x) { return 99; } }\n",
+    );
+    repo.commit_all("base");
+    repo.write(
+        "src/contract.cs",
+        "interface IWorker { long Run(int x, int flags); }\n",
+    );
+    for head in ["worktree", "HEAD"] {
+        if head == "HEAD" {
+            repo.commit_all("contract change");
+        }
+        let base = if head == "HEAD" { "HEAD~1" } else { "HEAD" };
+        let (code, out, err) = repo.run(&[base, head, "--json"]);
+        assert_eq!(code, 0, "{err}");
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let nodes = value["nodes"].as_array().unwrap();
+        let contract = nodes.iter().find(|n| n["name"] == "IWorker::Run").unwrap();
+        assert_eq!(contract["status"], "changed");
+        assert_eq!(contract["kind"], "declaration");
+        for name in ["Base::Run", "Worker::Run", "Leaf"] {
+            let symbol = nodes.iter().find(|n| n["name"] == name).unwrap();
+            assert_eq!(symbol["status"], "unchanged");
+            assert_eq!(symbol["relevant"], true, "{symbol}");
+            assert!(symbol["head"].is_object());
+        }
+        assert!(
+            nodes
+                .iter()
+                .all(|n| !n["name"].as_str().unwrap().starts_with("Unrelated")),
+            "{out}"
+        );
+        let implementation = nodes.iter().find(|n| n["name"] == "Worker::Run").unwrap();
+        assert!(
+            implementation["contracts"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("src/base.cs::Base::Run")),
+            "{implementation}"
+        );
+        assert!(
+            contract["external_callers"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("src/app.cs::App::Start")),
+            "{contract}"
+        );
+        let (code, dump, err) = repo.run(&[base, head, "--dump", "--entry", "IWorker"]);
+        assert_eq!(code, 0, "{err}");
+        assert!(dump.contains("IWorker::Run"), "{dump}");
+    }
+}
+
+#[test]
+fn type_rename_and_base_list_change_have_separate_review_spans() {
+    let repo = Repo::new("type-rename");
+    let base = "abstract class Base {\n public abstract int Run();\n}\nclass Worker : Base {\n public override int Run() { return 1; }\n}\n";
+    repo.write("src/worker.cs", base);
+    repo.commit_all("base");
+    repo.write("src/worker.cs", &base.replace("Base", "RenamedBase"));
+    let (code, out, err) = repo.run(&["HEAD", "--json"]);
+    assert_eq!(code, 0, "{err}");
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let nodes = value["nodes"].as_array().unwrap();
+    let renamed = nodes.iter().find(|n| n["name"] == "RenamedBase").unwrap();
+    assert_eq!(renamed["status"], "moved");
+    assert_eq!(renamed["moved_from"], "Base");
+    let derived = nodes.iter().find(|n| n["name"] == "Worker").unwrap();
+    assert_eq!(derived["status"], "changed");
+    assert_eq!(derived["head"]["start"], 4);
+    assert_eq!(derived["head"]["end"], 4);
+    let method = nodes.iter().find(|n| n["name"] == "Worker::Run").unwrap();
+    assert_eq!(method["status"], "unchanged");
+    assert!(derived["contracts"]
+        .as_array()
+        .unwrap()
+        .contains(&renamed["key"]));
+}
+
+#[test]
+fn edited_rename_uses_unique_similarity_but_rejects_ties() {
+    let repo = Repo::new("edited-rename");
+    let base = "pub fn calculate(input: i32) -> i32 { let offset = input * 3; let total = offset + 7; total.max(0) }\n";
+    repo.write("src/lib.rs", base);
+    repo.commit_all("base");
+    repo.write(
+        "src/lib.rs",
+        &base.replace("calculate", "compute").replace("+ 7", "+ 8"),
+    );
+    let (code, out, err) = repo.run(&["HEAD", "--json"]);
+    assert_eq!(code, 0, "{err}");
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let node = value["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["name"] == "compute")
+        .unwrap();
+    assert_eq!(node["status"], "changed");
+    assert_eq!(node["moved_from"], "calculate");
+    repo.write(
+        "src/lib.rs",
+        &format!("{}{}", base, base.replace("calculate", "alternate")),
+    );
+    repo.commit_all("ambiguous base");
+    repo.write(
+        "src/lib.rs",
+        &format!(
+            "{}{}",
+            base.replace("calculate", "first").replace("+ 7", "+ 8"),
+            base.replace("calculate", "second").replace("+ 7", "+ 8")
+        ),
+    );
+    let (code, out, err) = repo.run(&["HEAD", "--json"]);
+    assert_eq!(code, 0, "{err}");
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(value["summary"]["added"], 2);
+    assert_eq!(value["summary"]["removed"], 2);
+    assert_eq!(value["summary"]["moved"], 0);
+}
+
+#[test]
+fn recursive_rename_preserves_origin_without_an_edit_status() {
+    let repo = Repo::new("recursive-rename");
+    repo.write(
+        "src/lib.rs",
+        "fn repeat(n: u32) -> u32 { if n == 0 { 0 } else { repeat(n - 1) } }\n",
+    );
+    repo.commit_all("base");
+    repo.write(
+        "src/lib.rs",
+        "fn recur(n: u32) -> u32 { if n == 0 { 0 } else { recur(n - 1) } }\n",
+    );
+    let (code, out, err) = repo.run(&["HEAD", "--json"]);
+    assert_eq!(code, 0, "{err}");
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let node = value["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["name"] == "recur")
+        .unwrap();
+    assert_eq!(node["status"], "moved");
+    assert_eq!(node["moved_from"], "repeat");
+    assert_eq!(node["callees"], serde_json::json!(["src/lib.rs::recur"]));
+    assert_eq!(value["summary"]["removed"], 0);
+}
+
+#[test]
+fn removed_interface_member_retains_unchanged_typed_callers() {
+    let repo = Repo::new("removed-contract");
+    repo.write("src/contract.cs", "interface IWorker { int Run(); }\n");
+    repo.write(
+        "src/app.cs",
+        "class App { int Start(IWorker worker) { return worker.Run(); } }\n",
+    );
+    repo.write(
+        "src/unrelated.cs",
+        "class Unrelated { int Run() { return 1; } }\n",
+    );
+    repo.commit_all("base");
+    repo.write("src/contract.cs", "interface IWorker {}\n");
+    let (code, out, err) = repo.run(&["HEAD", "--json"]);
+    assert_eq!(code, 0, "{err}");
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let removed = value["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["name"] == "IWorker::Run")
+        .unwrap();
+    assert_eq!(removed["status"], "removed");
+    assert_eq!(
+        removed["external_callers"],
+        serde_json::json!(["src/app.cs::App::Start"])
+    );
+    assert!(removed["head"].is_null());
+}
+
+#[test]
+fn empty_rust_trait_impl_addition_reviews_its_own_header() {
+    let repo = Repo::new("rust-empty-impl");
+    let base = "trait Work { fn run(&self) -> u32 { 1 } }\nstruct Worker;\n";
+    repo.write("src/lib.rs", base);
+    repo.commit_all("base");
+    repo.write(
+        "src/lib.rs",
+        &format!("{base}\nimpl Work for Worker {{}}\n"),
+    );
+    let value = json_review(&repo);
+    let header = json_node(&value, "<Worker as Work>");
+    assert_eq!(header["kind"], "type");
+    assert_eq!(header["status"], "added");
+    assert_eq!(header["head"]["start"], 4);
+    assert_eq!(header["head"]["end"], 4);
+    assert!(header["base"].is_null());
+    assert_eq!(json_node(&value, "Worker")["status"], "unchanged");
+    assert!(
+        header["contracts"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("src/lib.rs::Work")),
+        "{value}"
+    );
+}
+
+#[test]
+fn explicit_base_call_does_not_dispatch_back_to_its_override() {
+    let repo = Repo::new("nonvirtual-base-call");
+    let base = "class Base { public virtual int Run() { return 1; } }\nclass Worker : Base { public override int Run() { return base.Run(); } }\n";
+    repo.write("src/worker.cs", base);
+    repo.commit_all("base");
+    repo.write("src/worker.cs", &base.replace("return 1", "return 2"));
+    let value = json_review(&repo);
+    let method = json_node(&value, "Worker::Run");
+    assert_eq!(
+        method["callees"],
+        serde_json::json!(["src/worker.cs::Base::Run"])
+    );
+    assert_eq!(method["relevant"], true);
+}
+
+#[test]
+fn indistinguishable_interface_member_renames_remain_unpaired() {
+    let repo = Repo::new("ambiguous-contract-renames");
+    repo.write(
+        "src/worker.ts",
+        "interface Worker { first(): void; second(): void; }\n",
+    );
+    repo.commit_all("base");
+    repo.write(
+        "src/worker.ts",
+        "interface Worker { third(): void; fourth(): void; }\n",
+    );
+    let value = json_review(&repo);
+    assert_eq!(json_node(&value, "Worker::first")["status"], "removed");
+    assert_eq!(json_node(&value, "Worker::second")["status"], "removed");
+    assert_eq!(json_node(&value, "Worker::third")["status"], "added");
+    assert_eq!(json_node(&value, "Worker::fourth")["status"], "added");
+    assert_eq!(value["summary"]["moved"], 0);
+}
+
+#[test]
+fn trait_rename_keeps_empty_implementation_header_history() {
+    let repo = Repo::new("rust-trait-rename");
+    let base =
+        "trait Work { fn run(&self) -> u32 { 1 } }\nstruct Worker;\nimpl Work for Worker {}\n";
+    repo.write("src/lib.rs", base);
+    repo.commit_all("base");
+    repo.write(
+        "src/lib.rs",
+        &base
+            .replace("trait Work ", "trait Task ")
+            .replace("impl Work for", "impl Task for"),
+    );
+    let value = json_review(&repo);
+    assert_eq!(json_node(&value, "Task")["moved_from"], "Work");
+    let header = json_node(&value, "<Worker as Task>");
+    assert_eq!(header["status"], "changed");
+    assert_eq!(header["moved_from"], "<Worker as Work>");
+    assert_eq!(header["base"]["start"], 3);
+    assert_eq!(header["head"]["start"], 3);
 }

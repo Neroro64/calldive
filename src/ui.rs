@@ -1,4 +1,4 @@
-//! ratatui UI: entry-point tree (left), per-function diff (right).
+//! ratatui UI: entry-point tree (left), per-symbol diff (right).
 
 use crate::analysis::{self, Analysis, Status, TreeRow};
 use crate::diffview::{fn_diff, DiffLine, Sign};
@@ -107,7 +107,7 @@ impl<'a> App<'a> {
             ),
             Span::raw("  "),
             Span::styled(
-                format!("[{:?}]", n.status),
+                format!("[{}; {}]", n.status.label(), n.kind.label()),
                 Style::default().fg(status_color(n.status)),
             ),
         ]));
@@ -122,13 +122,11 @@ impl<'a> App<'a> {
                 Style::default().fg(Color::DarkGray),
             )));
         }
-        if n.status == Status::Moved {
-            if let (Some(base), Some(origin)) = (&n.base, &n.moved_from) {
-                self.detail.push(Line::from(format!(
-                    "moved from {}::{origin}",
-                    self.a.label(&base.file)
-                )));
-            }
+        if let (Some(base), Some(origin)) = (&n.base, &n.moved_from) {
+            self.detail.push(Line::from(format!(
+                "moved from {}::{origin}",
+                self.a.label(&base.file)
+            )));
         }
 
         // callers (upstream impact)
@@ -218,6 +216,28 @@ impl<'a> App<'a> {
             }
         }
         self.detail.push(Line::from(cal));
+        for (label, related) in [
+            ("contracts (base/head)", &n.contracts),
+            ("implementations / members (base/head)", &n.implementations),
+        ] {
+            if related.is_empty() {
+                continue;
+            }
+            let names: Vec<_> = related
+                .iter()
+                .take(8)
+                .map(|key| self.a.nodes[key].name.as_str())
+                .collect();
+            let remainder = if related.len() > 8 {
+                format!(" … +{} more", related.len() - 8)
+            } else {
+                String::new()
+            };
+            self.detail.push(Line::from(format!(
+                "{label}: {}{remainder}",
+                names.join(", ")
+            )));
+        }
         self.detail.push(Line::from(""));
 
         let head_src = self.a.head_body(n);
@@ -398,10 +418,8 @@ fn expand_all(a: &Analysis, key: &str, expanded: &mut HashSet<String>, depth: us
         return;
     }
     expanded.insert(key.to_string());
-    if let Some(n) = a.nodes.get(key) {
-        for c in &n.callees {
-            expand_all(a, c, expanded, depth - 1);
-        }
+    for child in analysis::children_of(a, key, false) {
+        expand_all(a, &child, expanded, depth - 1);
     }
 }
 
@@ -525,7 +543,7 @@ pub fn draw(f: &mut ratatui::Frame, app: &mut App) {
     // right: detail
     let detail_block = Block::default()
         .borders(Borders::ALL)
-        .title(" function diff ")
+        .title(" symbol diff ")
         .border_style(if app.focus == Focus::Detail {
             Style::default().fg(Color::Blue)
         } else {

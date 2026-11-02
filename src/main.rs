@@ -1,4 +1,5 @@
 mod analysis;
+mod contracts;
 mod diffview;
 mod git;
 mod syntax;
@@ -28,7 +29,7 @@ struct Args {
     #[arg(long)]
     repo: Option<String>,
 
-    /// start from a function name, qualified name, path-qualified name, or exact key
+    /// start from a symbol name, qualified name, path-qualified name, or exact key
     #[arg(short = 'e', long)]
     entry: Option<String>,
 
@@ -44,7 +45,7 @@ struct Args {
     #[arg(long)]
     all: bool,
 
-    /// include functions inside test modules / test files
+    /// include symbols inside test modules / test files
     #[arg(long)]
     tests: bool,
 
@@ -118,10 +119,10 @@ fn main() -> Result<()> {
                     .collect();
                 hits.sort();
                 match hits.len() {
-                    0 => bail!("--entry {e}: no function matches"),
+                    0 => bail!("--entry {e}: no symbol matches"),
                     1 => hits,
                     _ => bail!(
-                        "--entry {e}: ambiguous function matches:\n{}",
+                        "--entry {e}: ambiguous symbol matches:\n{}",
                         hits.join("\n")
                     ),
                 }
@@ -159,6 +160,7 @@ fn main() -> Result<()> {
             name: &'a str,
             file: &'a str,
             label: &'a str,
+            kind: &'a str,
             status: &'a str,
             head: Option<JsonSpan<'a>>,
             base: Option<JsonSpan<'a>>,
@@ -168,6 +170,8 @@ fn main() -> Result<()> {
             external_callers: &'a [String],
             callees: &'a [String],
             lost_callees: &'a [String],
+            implementations: &'a [String],
+            contracts: &'a [String],
         }
         #[derive(serde::Serialize)]
         struct JsonSummary {
@@ -212,6 +216,7 @@ fn main() -> Result<()> {
                     name: &n.name,
                     file: &n.file,
                     label: a.label(&n.file),
+                    kind: n.kind.label(),
                     status: n.status.label(),
                     head: n.head.as_ref().map(span),
                     base: n.base.as_ref().map(span),
@@ -221,6 +226,8 @@ fn main() -> Result<()> {
                     external_callers: &n.external_callers,
                     callees: &n.callees,
                     lost_callees: &n.lost_callees,
+                    implementations: &n.implementations,
+                    contracts: &n.contracts,
                 })
                 .collect(),
         };
@@ -229,7 +236,7 @@ fn main() -> Result<()> {
     }
     if args.dump {
         println!(
-            "calldive {base} → {head_label}   fns +{ad} -{rm} ~{ch} >{mv}   entry points: {}",
+            "calldive {base} → {head_label}   symbols +{ad} -{rm} ~{ch} >{mv}   entry points: {}",
             roots.len()
         );
         let expanded: HashSet<String> = roots.iter().cloned().collect();
@@ -271,8 +278,8 @@ fn main() -> Result<()> {
 type ChangedSources = Vec<(String, Option<String>, Option<String>)>;
 const MAX_EXTRA_BYTES: usize = 512 * 1024;
 
-/// Load changed blobs first, then retain only unchanged files mentioning their
-/// function names. Both phases share a single git cat-file process.
+/// Load changed blobs first, then scan unchanged callers and the transitive
+/// explicit type hierarchy. All phases share one git cat-file process.
 fn gather_sources(
     repo: &git::GitRepo,
     changes: &[git::FileChange],
@@ -364,59 +371,88 @@ fn gather_sources(
             }
             Ok(())
         })?;
-        let Some(search) = changed_name_search(&files)? else {
-            return Ok(());
-        };
-        if let Some(blobs) = &head_blobs {
-            let mut candidates: Vec<&git::Blob> = blobs
-                .iter()
-                .filter(|blob| {
-                    !changed_set.contains(blob.path.as_str())
-                        && syntax::lang_for_path(&blob.path).is_some()
-                        && blob.size <= MAX_EXTRA_BYTES
-                })
-                .collect();
-            candidates.sort_by(|a, b| a.path.cmp(&b.path));
-            let oids: Vec<&str> = candidates.iter().map(|blob| blob.oid.as_str()).collect();
-            reader.read(&oids, |index, source| {
-                let path = &candidates[index].path;
-                let source = source.with_context(|| {
-                    format!("missing unchanged source '{path}' at rev '{head_label}'")
-                })?;
-                if source.len() <= MAX_EXTRA_BYTES && contains_identifier(&search, &source) {
-                    extra_files.push((path.clone(), source));
-                }
-                Ok(())
-            })?;
+        let mut terms = changed_terms(&files);
+        let mut pending = terms.clone();
+        let mut selected: HashSet<String> =
+            changed_set.iter().map(|path| (*path).to_string()).collect();
+        let tracked = if head_blobs.is_none() {
+            repo.tracked_files()?
         } else {
-            for path in repo.tracked_files()? {
-                if changed_set.contains(path.as_str()) || syntax::lang_for_path(&path).is_none() {
-                    continue;
-                }
-                let metadata = match std::fs::metadata(repo.root.join(&path)) {
-                    Ok(metadata) => metadata,
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                    Err(error) => {
-                        return Err(error)
-                            .with_context(|| format!("reading worktree metadata '{path}'"))
-                    }
-                };
-                if metadata.len() > MAX_EXTRA_BYTES as u64 {
-                    continue;
-                }
-                let source = match repo.read_worktree(&path) {
-                    Ok(source) => source,
-                    Err(error)
-                        if error
-                            .downcast_ref::<std::io::Error>()
-                            .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
-                    {
-                        continue
-                    }
-                    Err(error) => return Err(error),
-                };
+            Vec::new()
+        };
+        while let Some(search) = identifier_search(std::mem::take(&mut pending))? {
+            let mut retain = |path: &str, source: String| {
                 if source.len() <= MAX_EXTRA_BYTES && contains_identifier(&search, &source) {
-                    extra_files.push((path, source));
+                    // Expand only hierarchy names, not every newly discovered
+                    // callable: this follows inherited implementations without
+                    // growing into an unrelated whole-repository call graph.
+                    for term in contract_terms(path, &source) {
+                        if terms.insert(term.clone()) {
+                            pending.insert(term);
+                        }
+                    }
+                    extra_files.push((path.to_string(), source));
+                    true
+                } else {
+                    false
+                }
+            };
+            if let Some(blobs) = &head_blobs {
+                let mut candidates: Vec<_> = blobs
+                    .iter()
+                    .filter(|blob| {
+                        !selected.contains(&blob.path)
+                            && syntax::lang_for_path(&blob.path).is_some()
+                            && blob.size <= MAX_EXTRA_BYTES
+                    })
+                    .collect();
+                candidates.sort_by(|a, b| a.path.cmp(&b.path));
+                let oids: Vec<_> = candidates.iter().map(|blob| blob.oid.as_str()).collect();
+                reader.read(&oids, |index, source| {
+                    let path = &candidates[index].path;
+                    if retain(
+                        path,
+                        source.with_context(|| {
+                            format!("missing unchanged source '{path}' at rev '{head_label}'")
+                        })?,
+                    ) {
+                        selected.insert(path.clone());
+                    }
+                    Ok(())
+                })?;
+            } else {
+                let candidates: Vec<_> = tracked
+                    .iter()
+                    .filter(|path| {
+                        !selected.contains(*path) && syntax::lang_for_path(path).is_some()
+                    })
+                    .collect();
+                for path in candidates {
+                    let metadata = match std::fs::metadata(repo.root.join(path)) {
+                        Ok(metadata) => metadata,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(error) => {
+                            return Err(error)
+                                .with_context(|| format!("reading worktree metadata '{path}'"))
+                        }
+                    };
+                    if metadata.len() > MAX_EXTRA_BYTES as u64 {
+                        continue;
+                    }
+                    let source = match repo.read_worktree(path) {
+                        Ok(source) => source,
+                        Err(error)
+                            if error.downcast_ref::<std::io::Error>().is_some_and(|error| {
+                                error.kind() == std::io::ErrorKind::NotFound
+                            }) =>
+                        {
+                            continue
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    if retain(path, source) {
+                        selected.insert(path.clone());
+                    }
                 }
             }
         }
@@ -426,34 +462,60 @@ fn gather_sources(
     Ok((files, extra_files))
 }
 
-fn changed_name_search(files: &ChangedSources) -> Result<Option<aho_corasick::AhoCorasick>> {
+fn changed_terms(files: &ChangedSources) -> HashSet<String> {
     let mut terms = HashSet::new();
     for (path, base, head) in files {
         for source in [base, head].into_iter().flatten() {
             if let Some(parsed) = syntax::parse_file(path, source) {
-                for function in parsed.fns {
-                    for term in function
-                        .name
-                        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-                    {
-                        if !term.is_empty() {
-                            terms.insert(term.to_string());
-                        }
+                for symbol in parsed.fns {
+                    add_identifier_terms(&symbol.name, &mut terms);
+                    for base in &symbol.bases {
+                        add_identifier_terms(base, &mut terms);
+                    }
+                    if let Some(owner) = &symbol.owner {
+                        add_identifier_terms(owner, &mut terms);
                     }
                 }
             }
         }
     }
+    terms
+}
+
+fn contract_terms(path: &str, source: &str) -> HashSet<String> {
+    let mut terms = HashSet::new();
+    if let Some(parsed) = syntax::parse_file(path, source) {
+        for symbol in parsed.fns {
+            if symbol.kind == syntax::SymbolKind::Type {
+                add_identifier_terms(&symbol.name, &mut terms);
+            }
+            for base in &symbol.bases {
+                add_identifier_terms(base, &mut terms);
+            }
+        }
+    }
+    terms
+}
+
+fn add_identifier_terms(name: &str, terms: &mut HashSet<String>) {
+    for term in name.split(|c: char| !c.is_alphanumeric() && c != '_') {
+        if !term.is_empty() && !matches!(term, "as" | "dyn" | "impl" | "mut" | "const") {
+            terms.insert(term.to_string());
+        }
+    }
+}
+
+fn identifier_search(terms: HashSet<String>) -> Result<Option<aho_corasick::AhoCorasick>> {
     if terms.is_empty() {
         return Ok(None);
     }
-    let mut terms: Vec<String> = terms.into_iter().collect();
+    let mut terms: Vec<_> = terms.into_iter().collect();
     terms.sort();
     Ok(Some(
         aho_corasick::AhoCorasickBuilder::new()
             .match_kind(aho_corasick::MatchKind::Standard)
             .build(terms)
-            .context("building changed-function identifier search")?,
+            .context("building symbol identifier search")?,
     ))
 }
 
@@ -497,7 +559,7 @@ mod input_tests {
                 "class Worker { public: ~Worker() {} int operator()() { return 1; } };".to_string(),
             ),
         )];
-        let search = changed_name_search(&files)
+        let search = identifier_search(changed_terms(&files))
             .unwrap()
             .expect("function names");
         assert!(contains_identifier(&search, "Worker object;"));

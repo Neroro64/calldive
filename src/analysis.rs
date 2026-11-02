@@ -2,7 +2,8 @@
 //! entry points and the DFS review tree. Symbols retain revision-specific spans;
 //! call resolution considers the complete same-language revision universe.
 
-use crate::syntax::{self, FnDef, Lang};
+use crate::contracts::{ContractFile, ContractGraph};
+use crate::syntax::{self, CallSite, FnDef, Lang, SymbolKind};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,6 +48,8 @@ pub struct Span {
     pub file: String,
     pub start_row: usize,
     pub end_row: usize,
+    pub start_byte: usize,
+    pub end_byte: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -54,6 +57,7 @@ pub struct Node {
     pub key: String,
     pub file: String,
     pub name: String,
+    pub kind: SymbolKind,
     pub status: Status,
     pub head: Option<Span>,
     pub base: Option<Span>,
@@ -62,6 +66,9 @@ pub struct Node {
     pub external_callers: Vec<String>,
     pub callees: Vec<String>,
     pub lost_callees: Vec<String>,
+    /// Explicit type/member and contract/implementation edges, not call edges.
+    pub implementations: Vec<String>,
+    pub contracts: Vec<String>,
     pub relevant: bool,
 }
 
@@ -98,21 +105,7 @@ impl Analysis {
 
 fn revision_body(srcs: &HashMap<String, String>, span: &Span) -> Option<String> {
     let src = srcs.get(&span.file)?;
-    let mut body = String::new();
-    for (i, line) in src
-        .lines()
-        .skip(span.start_row)
-        .take(span.end_row.saturating_sub(span.start_row))
-        .enumerate()
-    {
-        if i > 0 {
-            body.push('\n');
-        }
-        for part in line.split('\r') {
-            body.push_str(part);
-        }
-    }
-    Some(body)
+    Some(src.get(span.start_byte..span.end_byte)?.replace('\r', ""))
 }
 
 pub struct Inputs {
@@ -131,27 +124,49 @@ struct FileData {
     fns: Vec<FnDef>,
     display: Vec<Option<String>>,
     keys: Vec<Option<String>>,
-    calls: Vec<Vec<String>>,
+    calls: Vec<Vec<CallSite>>,
     by_name: HashMap<String, Vec<usize>>,
 }
 
 impl FileData {
     fn parse(path: &str, src: &str, include_tests: bool) -> Option<Self> {
         let family = syntax::lang_for_path(path)?.family();
-        let parsed = syntax::parse_file(path, src)?;
+        let mut parsed = syntax::parse_file(path, src)?;
+        if !include_tests {
+            let mut remap = vec![None; parsed.fns.len()];
+            let mut next = 0;
+            parsed.fns = parsed
+                .fns
+                .into_iter()
+                .enumerate()
+                .filter_map(|(old, symbol)| {
+                    if symbol.is_test {
+                        None
+                    } else {
+                        remap[old] = Some(next);
+                        next += 1;
+                        Some(symbol)
+                    }
+                })
+                .collect();
+            parsed.calls.retain_mut(|call| {
+                if let Some(caller) = remap[call.caller] {
+                    call.caller = caller;
+                    true
+                } else {
+                    false
+                }
+            });
+        }
         let mut qual_counts: HashMap<&str, usize> = HashMap::new();
         for f in &parsed.fns {
-            if include_tests || !f.is_test {
-                *qual_counts.entry(&f.qual).or_default() += 1;
-            }
+            *qual_counts.entry(&f.qual).or_default() += 1;
         }
         let mut display: Vec<Option<String>> = parsed
             .fns
             .iter()
             .map(|f| {
-                if f.is_test && !include_tests {
-                    None
-                } else if qual_counts[f.qual.as_str()] > 1 {
+                if qual_counts[f.qual.as_str()] > 1 {
                     Some(format!("{}{}", f.qual, f.sig))
                 } else {
                     Some(f.qual.clone())
@@ -186,12 +201,12 @@ impl FileData {
         let mut calls = vec![Vec::new(); parsed.fns.len()];
         for call in parsed.calls {
             if display.get(call.caller).is_some_and(Option::is_some) {
-                calls[call.caller].push(call.name);
+                calls[call.caller].push(call);
             }
         }
         let mut by_name: HashMap<String, Vec<usize>> = HashMap::new();
         for (i, f) in parsed.fns.iter().enumerate() {
-            if display[i].is_some() {
+            if display[i].is_some() && f.kind != SymbolKind::Type {
                 by_name.entry(f.name.clone()).or_default().push(i);
             }
         }
@@ -212,33 +227,51 @@ impl FileData {
             file: self.path.clone(),
             start_row: f.start_row,
             end_row: f.end_row,
+            start_byte: f.start_byte,
+            end_byte: f.end_byte,
         }
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 struct DefId {
     file: usize,
     function: usize,
 }
 
+type OwnerFingerprint<'a> = (Lang, bool, u64, &'a str, Option<&'a str>);
+
+#[derive(Default)]
+struct RevisionGroup {
+    base: Vec<usize>,
+    head: Vec<usize>,
+}
+
 /// Pair within qualified-name groups, retaining appearance order for hashes.
 fn pair_functions(base: &FileData, head: &FileData) -> Vec<(usize, usize)> {
-    let mut groups: BTreeMap<&str, (Vec<usize>, Vec<usize>)> = BTreeMap::new();
+    let mut groups: BTreeMap<(&str, bool), RevisionGroup> = BTreeMap::new();
     for (i, f) in base.fns.iter().enumerate() {
         if base.display[i].is_some() {
-            groups.entry(&f.qual).or_default().0.push(i);
+            groups
+                .entry((&f.qual, f.kind == SymbolKind::Type))
+                .or_default()
+                .base
+                .push(i);
         }
     }
     for (i, f) in head.fns.iter().enumerate() {
         if head.display[i].is_some() {
-            groups.entry(&f.qual).or_default().1.push(i);
+            groups
+                .entry((&f.qual, f.kind == SymbolKind::Type))
+                .or_default()
+                .head
+                .push(i);
         }
     }
     let mut paired_base = vec![false; base.fns.len()];
     let mut paired_head = vec![false; head.fns.len()];
     let mut pairs = Vec::new();
-    for (bs, hs) in groups.values() {
+    for RevisionGroup { base: bs, head: hs } in groups.values() {
         if bs.len() == 1 && hs.len() == 1 {
             pairs.push((bs[0], hs[0]));
             continue;
@@ -362,26 +395,62 @@ pub fn analyze(inputs: &Inputs) -> Analysis {
             }
         }
         removed.sort_by(|a, b| a.0.cmp(b.0));
-        let mut by_hash: HashMap<(Lang, u64), VecDeque<DefId>> = HashMap::new();
-        let mut by_file: HashMap<(Lang, u64, &str), VecDeque<DefId>> = HashMap::new();
+        let mut by_hash: HashMap<(Lang, bool, u64), VecDeque<DefId>> = HashMap::new();
+        let mut by_file: HashMap<(Lang, bool, u64, &str), VecDeque<DefId>> = HashMap::new();
+        let mut by_owner: HashMap<OwnerFingerprint<'_>, VecDeque<DefId>> = HashMap::new();
         for (_, id) in removed {
             let data = &base_files[id.file];
-            let hash = data.fns[id.function].body_hash;
+            let hash = data.fns[id.function].rename_hash;
+            let is_type = data.fns[id.function].kind == SymbolKind::Type;
+            by_owner
+                .entry((
+                    data.family,
+                    is_type,
+                    hash,
+                    &data.path,
+                    data.fns[id.function].owner.as_deref(),
+                ))
+                .or_default()
+                .push_back(id);
             by_hash
-                .entry((data.family, hash))
+                .entry((data.family, is_type, hash))
                 .or_default()
                 .push_back(id);
             by_file
-                .entry((data.family, hash, &data.path))
+                .entry((data.family, is_type, hash, &data.path))
                 .or_default()
                 .push_back(id);
         }
         let mut added = Vec::new();
+        let mut added_hashes: HashMap<(Lang, bool, u64), usize> = HashMap::new();
+        let mut added_files: HashMap<(Lang, bool, u64, &str), usize> = HashMap::new();
+        let mut added_owners: HashMap<OwnerFingerprint<'_>, usize> = HashMap::new();
         for (file, data) in head_files.iter().enumerate() {
             for (function, key) in data.keys.iter().enumerate() {
                 if let Some(key) = key {
                     if origins[file][function].is_none() {
                         added.push((key.as_str(), DefId { file, function }));
+                        let f = &data.fns[function];
+                        *added_hashes
+                            .entry((data.family, f.kind == SymbolKind::Type, f.rename_hash))
+                            .or_default() += 1;
+                        *added_files
+                            .entry((
+                                data.family,
+                                f.kind == SymbolKind::Type,
+                                f.rename_hash,
+                                &data.path,
+                            ))
+                            .or_default() += 1;
+                        *added_owners
+                            .entry((
+                                data.family,
+                                f.kind == SymbolKind::Type,
+                                f.rename_hash,
+                                &data.path,
+                                f.owner.as_deref(),
+                            ))
+                            .or_default() += 1;
                     }
                 }
             }
@@ -389,14 +458,54 @@ pub fn analyze(inputs: &Inputs) -> Analysis {
         added.sort_by(|a, b| a.0.cmp(b.0));
         for (_, head) in added {
             let data = &head_files[head.file];
-            let hash = data.fns[head.function].body_hash;
-            let local = by_file
-                .get_mut(&(data.family, hash, data.path.as_str()))
-                .and_then(|queue| take_unconsumed(queue, &targets));
+            let hash = data.fns[head.function].rename_hash;
+            let is_type = data.fns[head.function].kind == SymbolKind::Type;
+            // Header/declaration hashes carry little evidence. Both revisions
+            // must have a unique candidate in the selected scope.
+            let sensitive = data.fns[head.function].kind != SymbolKind::Function;
+            let owner_key = (
+                data.family,
+                is_type,
+                hash,
+                data.path.as_str(),
+                data.fns[head.function].owner.as_deref(),
+            );
+            let file_key = (data.family, is_type, hash, data.path.as_str());
+            let hash_key = (data.family, is_type, hash);
+            let owner_unique = !sensitive
+                || (added_owners[&owner_key] == 1
+                    && by_owner.get(&owner_key).is_some_and(|ids| ids.len() == 1));
+            let file_unique = !sensitive
+                || (is_type
+                    && added_files[&file_key] == 1
+                    && by_file.get(&file_key).is_some_and(|ids| ids.len() == 1));
+            let global_unique = !sensitive
+                || (added_hashes[&hash_key] == 1
+                    && by_hash.get(&hash_key).is_some_and(|ids| ids.len() == 1));
+            let local = owner_unique
+                .then(|| {
+                    by_owner
+                        .get_mut(&owner_key)
+                        .and_then(|queue| take_unconsumed(queue, &targets))
+                })
+                .flatten()
+                .or_else(|| {
+                    file_unique
+                        .then(|| {
+                            by_file
+                                .get_mut(&file_key)
+                                .and_then(|queue| take_unconsumed(queue, &targets))
+                        })
+                        .flatten()
+                });
             let origin = local.or_else(|| {
-                by_hash
-                    .get_mut(&(data.family, hash))
-                    .and_then(|queue| take_unconsumed(queue, &targets))
+                global_unique
+                    .then(|| {
+                        by_hash
+                            .get_mut(&hash_key)
+                            .and_then(|queue| take_unconsumed(queue, &targets))
+                    })
+                    .flatten()
             });
             if let Some(base) = origin {
                 origins[head.file][head.function] = Some(base);
@@ -406,6 +515,21 @@ pub fn analyze(inputs: &Inputs) -> Analysis {
         }
     }
 
+    pair_container_renames(
+        &base_files,
+        &head_files,
+        &mut origins,
+        &mut targets,
+        &mut moved,
+    );
+    pair_edited_renames(
+        &base_files,
+        &head_files,
+        &mut origins,
+        &mut targets,
+        &mut moved,
+    );
+
     let mut nodes = HashMap::new();
     let mut label_paths = HashSet::new();
     for (file, data) in head_files.iter().enumerate() {
@@ -414,7 +538,12 @@ pub fn analyze(inputs: &Inputs) -> Analysis {
             let f = &data.fns[function];
             let origin = origins[file][function];
             let status = match origin {
-                Some(_) if moved[file][function] => Status::Moved,
+                Some(b)
+                    if moved[file][function]
+                        && base_files[b.file].fns[b.function].rename_hash == f.rename_hash =>
+                {
+                    Status::Moved
+                }
                 Some(b) if base_files[b.file].fns[b.function].body_hash == f.body_hash => {
                     Status::Unchanged
                 }
@@ -432,6 +561,7 @@ pub fn analyze(inputs: &Inputs) -> Analysis {
                     key: key.clone(),
                     file: data.path.clone(),
                     name: data.display[function].as_ref().unwrap().clone(),
+                    kind: f.kind,
                     status,
                     head: Some(data.span(function)),
                     base,
@@ -445,6 +575,8 @@ pub fn analyze(inputs: &Inputs) -> Analysis {
                     external_callers: Vec::new(),
                     callees: Vec::new(),
                     lost_callees: Vec::new(),
+                    implementations: Vec::new(),
+                    contracts: Vec::new(),
                     relevant: status.is_change(),
                 },
             );
@@ -476,6 +608,7 @@ pub fn analyze(inputs: &Inputs) -> Analysis {
                     key,
                     file: data.path.clone(),
                     name,
+                    kind: data.fns[function].kind,
                     status: Status::Removed,
                     head: None,
                     base: Some(data.span(function)),
@@ -484,27 +617,135 @@ pub fn analyze(inputs: &Inputs) -> Analysis {
                     external_callers: Vec::new(),
                     callees: Vec::new(),
                     lost_callees: Vec::new(),
+                    implementations: Vec::new(),
+                    contracts: Vec::new(),
                     relevant: true,
                 },
             );
         }
     }
 
-    let mut removed_names: HashMap<(Lang, &str), Vec<&str>> = HashMap::new();
+    // Keep ordinary unchanged callers external, but include unchanged symbols
+    // that are explicit contract/implementation context for the review.
+    let head_contracts = contract_graph(head_files.iter().chain(extras.iter()));
+    let base_contracts = contract_graph(base_files.iter().chain(extras.iter()));
+    let mut context = HashSet::new();
+    for (files, graph) in [
+        (&head_files, &head_contracts),
+        (&base_files, &base_contracts),
+    ] {
+        let count = files.len();
+        let mut seen = HashSet::new();
+        let mut pending: Vec<_> = (0..count)
+            .flat_map(|file| {
+                let data = &files[file];
+                (0..data.fns.len())
+                    .filter(|&i| data.display[i].is_some())
+                    .map(move |i| (file, i))
+            })
+            .collect();
+        while let Some(id) = pending.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            if id.0 >= count {
+                context.insert((id.0 - count, id.1));
+            }
+            pending.extend(
+                graph
+                    .implementations
+                    .get(&id)
+                    .into_iter()
+                    .flatten()
+                    .copied(),
+            );
+            pending.extend(graph.contracts.get(&id).into_iter().flatten().copied());
+        }
+    }
+    for (file, function) in context {
+        let data = &mut extras[file];
+        let Some(name) = data.display[function].as_ref() else {
+            continue;
+        };
+        let key = node_key(&data.path, name);
+        data.keys[function] = Some(key.clone());
+        let span = data.span(function);
+        nodes.insert(
+            key.clone(),
+            Node {
+                key,
+                file: data.path.clone(),
+                name: name.clone(),
+                kind: data.fns[function].kind,
+                status: Status::Unchanged,
+                head: Some(span.clone()),
+                base: Some(span),
+                moved_from: None,
+                callers: Vec::new(),
+                external_callers: Vec::new(),
+                callees: Vec::new(),
+                lost_callees: Vec::new(),
+                implementations: Vec::new(),
+                contracts: Vec::new(),
+                relevant: false,
+            },
+        );
+        label_paths.insert(data.path.clone());
+    }
+    for (path, src) in &inputs.extra_head {
+        if label_paths.contains(path) {
+            head_srcs.insert(path.clone(), src.clone());
+            base_srcs.insert(path.clone(), src.clone());
+        }
+    }
+    attach_contracts(
+        &head_contracts,
+        &head_files.iter().chain(extras.iter()).collect::<Vec<_>>(),
+        &mut nodes,
+    );
+    attach_contracts(
+        &base_contracts,
+        &base_files.iter().chain(extras.iter()).collect::<Vec<_>>(),
+        &mut nodes,
+    );
+
+    let mut removed_names = RemovedDefinitions::default();
     for (file, data) in base_files.iter().enumerate() {
         for (i, key) in data.keys.iter().enumerate() {
-            if targets[file][i].is_none() {
+            if targets[file][i].is_none() && data.fns[i].kind != SymbolKind::Type {
                 if let Some(key) = key {
                     removed_names
+                        .names
                         .entry((data.family, &data.fns[i].name))
                         .or_default()
                         .push(key);
+                    if let Some(owner) = data.fns[i].owner.as_deref() {
+                        removed_names
+                            .members
+                            .entry((data.family, owner, data.fns[i].name.as_str()))
+                            .or_default()
+                            .push(key);
+                        let simple = owner.rsplit("::").next().unwrap();
+                        if simple != owner {
+                            removed_names
+                                .members
+                                .entry((data.family, simple, data.fns[i].name.as_str()))
+                                .or_default()
+                                .push(key);
+                        }
+                    }
                 }
             }
         }
     }
-    let head_universe = Universe::new(head_files.iter().chain(extras.iter()).collect());
-    let base_universe = Universe::new(base_files.iter().chain(extras.iter()).collect());
+    let head_universe = Universe::new(
+        head_files.iter().chain(extras.iter()).collect(),
+        head_contracts,
+    );
+    let base_universe = Universe::new(
+        base_files.iter().chain(extras.iter()).collect(),
+        base_contracts,
+    );
     for (file, data) in head_files.iter().enumerate() {
         for (function, key) in data.keys.iter().enumerate() {
             if let Some(key) = key {
@@ -533,14 +774,18 @@ pub fn analyze(inputs: &Inputs) -> Analysis {
             if display.is_none() {
                 continue;
             }
-            let (callees, _) = head_universe.resolve_calls(
+            let (callees, lost) = head_universe.resolve_calls(
                 head_files.len() + file,
                 function,
                 Some(&removed_names),
             );
-            if !callees.is_empty() {
+            if let Some(key) = &data.keys[function] {
+                let node = nodes.get_mut(key).unwrap();
+                node.callees = callees;
+                node.lost_callees = lost;
+            } else if !callees.is_empty() {
                 label_paths.insert(data.path.clone());
-                let caller = node_key(&data.path, &data.fns[function].qual);
+                let caller = node_key(&data.path, data.display[function].as_ref().unwrap());
                 for callee in callees {
                     nodes
                         .get_mut(&callee)
@@ -588,6 +833,327 @@ pub fn analyze(inputs: &Inputs) -> Analysis {
     }
 }
 
+fn contract_graph<'a>(files: impl Iterator<Item = &'a FileData>) -> ContractGraph {
+    let files: Vec<_> = files
+        .map(|data| ContractFile {
+            family: data.family,
+            symbols: &data.fns,
+        })
+        .collect();
+    ContractGraph::new(&files)
+}
+
+/// Dependency edges from either revision preserve impact paths when a signature
+/// or base-list edit breaks a previously valid implementation relationship.
+fn attach_contracts(graph: &ContractGraph, files: &[&FileData], nodes: &mut HashMap<String, Node>) {
+    for (&(file, function), children) in &graph.implementations {
+        let Some(parent) = &files[file].keys[function] else {
+            continue;
+        };
+        for &(child_file, child_function) in children {
+            let Some(child) = &files[child_file].keys[child_function] else {
+                continue;
+            };
+            if !nodes.contains_key(parent) || !nodes.contains_key(child) {
+                continue;
+            }
+            nodes
+                .get_mut(parent)
+                .unwrap()
+                .implementations
+                .push(child.clone());
+            nodes.get_mut(child).unwrap().contracts.push(parent.clone());
+        }
+    }
+    for node in nodes.values_mut() {
+        sort_dedup(&mut node.implementations);
+        sort_dedup(&mut node.contracts);
+    }
+}
+
+/// Matched members provide identity evidence when a container was renamed and
+/// its heritage edited together. Require one-to-one ownership, never a guess
+/// based solely on a short `class`/`interface` header.
+fn pair_container_renames(
+    base: &[FileData],
+    head: &[FileData],
+    origins: &mut [Vec<Option<DefId>>],
+    targets: &mut [Vec<Option<DefId>>],
+    moved: &mut [Vec<bool>],
+) {
+    let mut old_types = HashMap::new();
+    let mut new_types = HashMap::new();
+    for (file, data) in base.iter().enumerate() {
+        for (function, f) in data.fns.iter().enumerate() {
+            if f.kind == SymbolKind::Type && targets[file][function].is_none() {
+                old_types
+                    .entry((data.family, data.path.as_str(), f.qual.as_str()))
+                    .or_insert_with(Vec::new)
+                    .push(DefId { file, function });
+            }
+        }
+    }
+    for (file, data) in head.iter().enumerate() {
+        for (function, f) in data.fns.iter().enumerate() {
+            if f.kind == SymbolKind::Type && origins[file][function].is_none() {
+                new_types
+                    .entry((data.family, data.path.as_str(), f.qual.as_str()))
+                    .or_insert_with(Vec::new)
+                    .push(DefId { file, function });
+            }
+        }
+    }
+    let mut forward: HashMap<DefId, HashSet<DefId>> = HashMap::new();
+    let mut reverse: HashMap<DefId, HashSet<DefId>> = HashMap::new();
+    for (file, data) in head.iter().enumerate() {
+        for (function, origin) in origins[file].iter().enumerate() {
+            let Some(b) = origin else { continue };
+            let (Some(old_owner), Some(new_owner)) = (
+                &base[b.file].fns[b.function].owner,
+                &data.fns[function].owner,
+            ) else {
+                continue;
+            };
+            let Some(old) =
+                old_types.get(&(data.family, base[b.file].path.as_str(), old_owner.as_str()))
+            else {
+                continue;
+            };
+            let Some(new) = new_types.get(&(data.family, data.path.as_str(), new_owner.as_str()))
+            else {
+                continue;
+            };
+            if let ([old], [new]) = (old.as_slice(), new.as_slice()) {
+                forward.entry(*old).or_default().insert(*new);
+                reverse.entry(*new).or_default().insert(*old);
+            }
+        }
+    }
+    for (b, candidates) in forward {
+        if candidates.len() != 1 {
+            continue;
+        }
+        let h = *candidates.iter().next().unwrap();
+        if reverse[&h].len() == 1 {
+            origins[h.file][h.function] = Some(b);
+            targets[b.file][b.function] = Some(h);
+            moved[h.file][h.function] = true;
+        }
+    }
+}
+
+/// A rename plus an edit needs evidence beyond a generic empty body. Prefer
+/// corresponding callsite rewrites; otherwise require a mutual unique, strong
+/// token match within the same file/container. Ambiguous candidates stay churn.
+fn pair_edited_renames(
+    base: &[FileData],
+    head: &[FileData],
+    origins: &mut [Vec<Option<DefId>>],
+    targets: &mut [Vec<Option<DefId>>],
+    moved: &mut [Vec<bool>],
+) {
+    let mut hints = HashSet::new();
+    for (hf, data) in head.iter().enumerate() {
+        for (hi, origin) in origins[hf].iter().enumerate() {
+            let Some(b) = origin else { continue };
+            let old = &base[b.file].calls[b.function];
+            let new = &data.calls[hi];
+            if old.len() == new.len() {
+                for (a, z) in old.iter().zip(new) {
+                    if a.name != z.name
+                        && a.receiver == z.receiver
+                        && a.dispatch == z.dispatch
+                        && !new.iter().any(|c| c.name == a.name)
+                        && !old.iter().any(|c| c.name == z.name)
+                    {
+                        hints.insert((data.family, a.name.as_str(), z.name.as_str()));
+                    }
+                }
+            }
+        }
+    }
+    let mut owner_moves = HashMap::new();
+    for (bf, data) in base.iter().enumerate() {
+        for (bi, target) in targets[bf].iter().enumerate() {
+            if data.fns[bi].kind == SymbolKind::Type {
+                if let Some(h) = target {
+                    owner_moves.insert(
+                        (data.family, data.fns[bi].qual.as_str()),
+                        head[h.file].fns[h.function].qual.as_str(),
+                    );
+                }
+            }
+        }
+    }
+    let mut impl_moves = HashMap::new();
+    for (file, data) in base
+        .iter()
+        .enumerate()
+        .filter(|(_, data)| data.family == Lang::Rust)
+    {
+        for (function, symbol) in data.fns.iter().enumerate() {
+            if symbol.kind == SymbolKind::Type && targets[file][function].is_none() {
+                if let Some(qual) = renamed_impl_qual(&symbol.qual, &owner_moves) {
+                    impl_moves.insert(DefId { file, function }, qual);
+                }
+            }
+        }
+    }
+    let mut best_base: HashMap<DefId, (DefId, usize, bool)> = HashMap::new();
+    let mut best_head: HashMap<DefId, (DefId, usize, bool)> = HashMap::new();
+    let mut candidates: HashMap<(Lang, Option<&str>, bool), Vec<DefId>> = HashMap::new();
+    for (bf, data) in base.iter().enumerate() {
+        for (bi, b) in data.fns.iter().enumerate() {
+            if data.keys[bi].is_none() || targets[bf][bi].is_some() {
+                continue;
+            }
+            let owner = b
+                .owner
+                .as_deref()
+                .map(|o| owner_moves.get(&(data.family, o)).copied().unwrap_or(o));
+            candidates
+                .entry((data.family, owner, b.kind == SymbolKind::Type))
+                .or_default()
+                .push(DefId {
+                    file: bf,
+                    function: bi,
+                });
+        }
+    }
+    for (hf, data) in head.iter().enumerate() {
+        for (hi, h) in data.fns.iter().enumerate() {
+            if data.keys[hi].is_none() || origins[hf][hi].is_some() {
+                continue;
+            }
+            let Some(group) =
+                candidates.get(&(data.family, h.owner.as_deref(), h.kind == SymbolKind::Type))
+            else {
+                continue;
+            };
+            for &b in group {
+                let old = &base[b.file].fns[b.function];
+                let hinted = hints.contains(&(data.family, old.name.as_str(), h.name.as_str()));
+                let impl_renamed = impl_moves.get(&b).is_some_and(|qual| qual == &h.qual);
+                if base[b.file].path != data.path && !hinted && !impl_renamed {
+                    continue;
+                }
+                if old.kind == SymbolKind::Function
+                    && h.kind == SymbolKind::Function
+                    && old.owner == h.owner
+                    && (old.body_shape.is_none()
+                        || old.body_shape != h.body_shape
+                        || old.body_tokens.min(h.body_tokens) < 3)
+                {
+                    continue;
+                }
+                let score = if impl_renamed {
+                    4000
+                } else if old.name == h.name && old.owner != h.owner {
+                    if old.sig == h.sig {
+                        3500
+                    } else {
+                        3000
+                    }
+                } else if hinted && old.kind != SymbolKind::Type {
+                    let minimum = if old.kind == SymbolKind::Declaration {
+                        300
+                    } else {
+                        500
+                    };
+                    if token_similarity(&old.tokens, &h.tokens) < minimum {
+                        continue;
+                    }
+                    2000
+                } else {
+                    if old.tokens.len().min(h.tokens.len()) < 8 {
+                        continue;
+                    }
+                    let score = token_similarity(&old.tokens, &h.tokens);
+                    if score < 850 {
+                        continue;
+                    }
+                    score
+                };
+                let hid = DefId {
+                    file: hf,
+                    function: hi,
+                };
+                record_match(&mut best_base, b, hid, score);
+                record_match(&mut best_head, hid, b, score);
+            }
+        }
+    }
+    for (b, (h, _, tied)) in best_base {
+        if !tied
+            && best_head
+                .get(&h)
+                .is_some_and(|(candidate, _, tied)| *candidate == b && !tied)
+        {
+            origins[h.file][h.function] = Some(b);
+            targets[b.file][b.function] = Some(h);
+            moved[h.file][h.function] = base[b.file].path != head[h.file].path
+                || base[b.file].fns[b.function].qual != head[h.file].fns[h.function].qual;
+        }
+    }
+}
+
+fn renamed_impl_qual(qual: &str, renames: &HashMap<(Lang, &str), &str>) -> Option<String> {
+    let open = qual.find('<')?;
+    let prefix = &qual[..open];
+    let inner = qual[open + 1..].strip_suffix('>')?;
+    let rewrite = |reference: &str| {
+        let generic = reference.find('<').unwrap_or(reference.len());
+        let name = &reference[..generic];
+        let scoped = format!("{prefix}{name}");
+        let renamed = renames
+            .get(&(Lang::Rust, scoped.as_str()))
+            .or_else(|| renames.get(&(Lang::Rust, name)));
+        match renamed {
+            Some(new) => format!(
+                "{}{}",
+                new.strip_prefix(prefix).unwrap_or(new),
+                &reference[generic..]
+            ),
+            None => reference.to_string(),
+        }
+    };
+    let translated = match inner.split_once(" as ") {
+        Some((ty, contract)) => format!("{prefix}<{} as {}>", rewrite(ty), rewrite(contract)),
+        None => format!("{prefix}<{}>", rewrite(inner)),
+    };
+    (translated != qual).then_some(translated)
+}
+
+fn record_match(
+    index: &mut HashMap<DefId, (DefId, usize, bool)>,
+    key: DefId,
+    other: DefId,
+    score: usize,
+) {
+    let best = index.entry(key).or_insert((other, score, false));
+    if score > best.1 {
+        *best = (other, score, false);
+    } else if score == best.1 && other != best.0 {
+        best.2 = true;
+    }
+}
+
+fn token_similarity(a: &[u64], b: &[u64]) -> usize {
+    let (mut i, mut j, mut shared) = (0, 0, 0);
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+            std::cmp::Ordering::Equal => {
+                shared += 1;
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    2000 * shared / (a.len() + b.len()).max(1)
+}
+
 fn take_unconsumed(queue: &mut VecDeque<DefId>, targets: &[Vec<Option<DefId>>]) -> Option<DefId> {
     while let Some(id) = queue.pop_front() {
         if targets[id.file][id.function].is_none() {
@@ -597,17 +1163,24 @@ fn take_unconsumed(queue: &mut VecDeque<DefId>, targets: &[Vec<Option<DefId>>]) 
     None
 }
 
+#[derive(Default)]
+struct RemovedDefinitions<'a> {
+    names: HashMap<(Lang, &'a str), Vec<&'a str>>,
+    members: HashMap<(Lang, &'a str, &'a str), Vec<&'a str>>,
+}
+
 struct Universe<'a> {
     files: Vec<&'a FileData>,
     by_name: HashMap<(Lang, &'a str), Vec<DefId>>,
+    contracts: ContractGraph,
 }
 
 impl<'a> Universe<'a> {
-    fn new(files: Vec<&'a FileData>) -> Self {
+    fn new(files: Vec<&'a FileData>, contracts: ContractGraph) -> Self {
         let mut by_name: HashMap<(Lang, &str), Vec<DefId>> = HashMap::new();
         for (file, data) in files.iter().enumerate() {
             for (function, display) in data.display.iter().enumerate() {
-                if display.is_some() {
+                if display.is_some() && data.fns[function].kind != SymbolKind::Type {
                     by_name
                         .entry((data.family, &data.fns[function].name))
                         .or_default()
@@ -615,19 +1188,60 @@ impl<'a> Universe<'a> {
                 }
             }
         }
-        Self { files, by_name }
+        Self {
+            files,
+            by_name,
+            contracts,
+        }
     }
 
     fn resolve_calls(
         &self,
         file: usize,
         function: usize,
-        removed: Option<&HashMap<(Lang, &str), Vec<&str>>>,
+        removed: Option<&RemovedDefinitions<'_>>,
     ) -> (Vec<String>, Vec<String>) {
         let caller = self.files[file];
         let mut callees = Vec::new();
         let mut lost = Vec::new();
-        for name in &caller.calls[function] {
+        for call in &caller.calls[function] {
+            let name = &call.name;
+            if let Some(receiver) = &call.receiver {
+                let targets =
+                    self.contracts
+                        .receiver_targets(file, function, receiver, name, call.dispatch);
+                if targets.as_ref().is_none_or(Vec::is_empty) {
+                    if let Some([key]) = removed
+                        .and_then(|index| {
+                            index
+                                .members
+                                .get(&(caller.family, receiver.as_str(), name.as_str()))
+                        })
+                        .map(Vec::as_slice)
+                    {
+                        callees.push((*key).to_string());
+                        continue;
+                    }
+                }
+                if let Some(targets) = targets {
+                    let mut unresolved = targets.is_empty();
+                    for (target_file, target_function) in targets {
+                        if let Some(key) = &self.files[target_file].keys[target_function] {
+                            callees.push(key.clone());
+                        } else {
+                            unresolved = true;
+                        }
+                    }
+                    if unresolved {
+                        lost.push(name.clone());
+                    }
+                    continue;
+                }
+                // A typed but unresolved receiver must not bind to an
+                // unrelated same-name method in the current file.
+                lost.push(name.clone());
+                continue;
+            }
             let mut unresolved = false;
             if let Some(local) = caller.by_name.get(name) {
                 // Local overload sets shadow every other file, including
@@ -654,8 +1268,8 @@ impl<'a> Universe<'a> {
                         }
                     }
                     [] => {
-                        let fallback =
-                            removed.and_then(|index| index.get(&(caller.family, name.as_str())));
+                        let fallback = removed
+                            .and_then(|index| index.names.get(&(caller.family, name.as_str())));
                         match fallback.map(Vec::as_slice).unwrap_or(&[]) {
                             [key] => callees.push((*key).to_string()),
                             _ => unresolved = true,
@@ -695,6 +1309,7 @@ fn root_components(nodes: &HashMap<String, Node>) -> Vec<String> {
             nodes[*key]
                 .callees
                 .iter()
+                .chain(nodes[*key].implementations.iter())
                 .filter_map(|callee| indices.get(callee.as_str()).copied())
                 .collect()
         })
@@ -705,6 +1320,7 @@ fn root_components(nodes: &HashMap<String, Node>) -> Vec<String> {
             nodes[*key]
                 .callers
                 .iter()
+                .chain(nodes[*key].contracts.iter())
                 .filter_map(|caller| indices.get(caller.as_str()).copied())
                 .collect()
         })
@@ -777,24 +1393,41 @@ fn root_components(nodes: &HashMap<String, Node>) -> Vec<String> {
 }
 
 fn mark_relevant(nodes: &mut HashMap<String, Node>) {
-    let mut changed: Vec<String> = nodes
+    let changed: Vec<String> = nodes
         .iter()
         .filter(|(_, n)| n.status.is_change())
         .map(|(k, _)| k.clone())
         .collect();
-    changed.sort();
-    let mut queue: VecDeque<String> = changed.into();
-    while let Some(key) = queue.pop_front() {
-        // Discovery sets relevance immediately, so cycles enqueue once only.
-        let callers = std::mem::take(&mut nodes.get_mut(&key).unwrap().callers);
-        for caller in &callers {
-            let node = nodes.get_mut(caller).unwrap();
-            if !node.relevant {
-                node.relevant = true;
-                queue.push_back(caller.clone());
+    // A changed contract/type affects its explicit implementations, including
+    // unchanged inherited methods. Do this before propagating to callers so a
+    // changed implementation does not spuriously affect unrelated siblings.
+    let mut affected: HashSet<String> = changed.iter().cloned().collect();
+    let mut pending = changed;
+    while let Some(key) = pending.pop() {
+        for child in &nodes[&key].implementations {
+            if affected.insert(child.clone()) {
+                pending.push(child.clone());
             }
         }
-        nodes.get_mut(&key).unwrap().callers = callers;
+    }
+    let mut queue: VecDeque<String> = affected.iter().cloned().collect();
+    for key in &affected {
+        nodes.get_mut(key).unwrap().relevant = true;
+    }
+    while let Some(key) = queue.pop_front() {
+        let parents: Vec<_> = nodes[&key]
+            .callers
+            .iter()
+            .chain(&nodes[&key].contracts)
+            .cloned()
+            .collect();
+        for parent in parents {
+            let node = nodes.get_mut(&parent).unwrap();
+            if !node.relevant {
+                node.relevant = true;
+                queue.push_back(parent);
+            }
+        }
     }
 }
 
@@ -924,6 +1557,7 @@ pub fn children_of(a: &Analysis, key: &str, focus: bool) -> Vec<String> {
     let mut kids: Vec<String> = n
         .callees
         .iter()
+        .chain(n.implementations.iter())
         .filter(|c| a.nodes.contains_key(*c))
         .filter(|c| !focus || a.nodes.get(*c).map(|x| x.relevant).unwrap_or(true))
         .cloned()
@@ -1078,7 +1712,6 @@ mod tests {
             "struct A; struct B; impl A { fn new() { old(); } } impl B { fn new() { stable(); } }";
         let head = "struct A; struct B; impl A { fn new() { edited(); } } impl B { fn new() { stable(); } }";
         let a = analyze_pair("m.rs", Some(base), Some(head));
-        assert_eq!(a.nodes.len(), 2);
         assert_eq!(
             a.nodes[&node_key("m.rs", "A::new")].status,
             Status::BodyChanged
@@ -1096,7 +1729,6 @@ mod tests {
             "class Worker { void Log(int x) { Before(); } void Log(string s) { Stable(); } }";
         let head = "class Worker { void Log(int x) { After(); } void Log(string s) { Stable(); } }";
         let a = analyze_pair("Worker.cs", Some(base), Some(head));
-        assert_eq!(a.nodes.len(), 2);
         assert_eq!(
             a.nodes[&node_key("Worker.cs", "Worker::Log(int x)")].status,
             Status::BodyChanged
@@ -1384,9 +2016,6 @@ mod tests {
     fn moves_never_cross_language_families() {
         let base = "class Worker { void alpha() {} };";
         let head = "class Worker { void beta() {} }";
-        let base_defs = syntax::parse_file("base.cpp", base).unwrap();
-        let head_defs = syntax::parse_file("head.cs", head).unwrap();
-        assert_eq!(base_defs.fns[0].body_hash, head_defs.fns[0].body_hash);
         let a = analyze(&Inputs {
             files: vec![
                 ("base.cpp".into(), Some(base.into()), None),
@@ -1395,7 +2024,14 @@ mod tests {
             extra_head: vec![],
             include_tests: false,
         });
-        assert_eq!(a.summary, (1, 1, 0, 0));
+        assert_eq!(
+            a.nodes[&node_key("base.cpp", "Worker")].status,
+            Status::Removed
+        );
+        assert_eq!(
+            a.nodes[&node_key("head.cs", "Worker")].status,
+            Status::Added
+        );
         assert_eq!(
             a.nodes[&node_key("base.cpp", "Worker::alpha")].status,
             Status::Removed
@@ -1470,5 +2106,54 @@ mod tests {
             a.nodes[&node_key("m.rs", "caller")].callees,
             vec![node_key("m.rs", "helper")]
         );
+    }
+
+    #[test]
+    fn same_line_type_and_member_diffs_use_exact_utf8_source_ranges() {
+        let base = "// café\r\ninterface Worker { int Run(); int Stable(); }\r\n";
+        let head = base.replace("int Run()", "long Run(int flags)");
+        let a = analyze_pair("worker.cs", Some(base), Some(&head));
+        let header = &a.nodes[&node_key("worker.cs", "Worker")];
+        assert_eq!(header.status, Status::Unchanged);
+        assert_eq!(a.head_body(header).as_deref(), Some("interface Worker"));
+        assert_eq!(a.base_body(header), a.head_body(header));
+        let changed = &a.nodes[&node_key("worker.cs", "Worker::Run")];
+        assert_eq!(a.base_body(changed).as_deref(), Some("int Run();"));
+        assert_eq!(
+            a.head_body(changed).as_deref(),
+            Some("long Run(int flags);")
+        );
+        let stable = &a.nodes[&node_key("worker.cs", "Worker::Stable")];
+        assert_eq!(a.base_body(stable), a.head_body(stable));
+    }
+
+    #[test]
+    fn cfg_test_contracts_and_impl_headers_follow_test_visibility() {
+        let base = "#[cfg(test)] trait Hidden { fn run(&self); }\n#[cfg(test)] struct Worker;\n#[cfg(test)] impl Hidden for Worker { fn run(&self) {} }\nfn live() -> u32 { 1 }\n";
+        let head = base.replace("{ 1 }", "{ 2 }");
+        for include_tests in [false, true] {
+            let a = analyze(&Inputs {
+                files: vec![("m.rs".into(), Some(base.into()), Some(head.clone()))],
+                extra_head: vec![],
+                include_tests,
+            });
+            for name in [
+                "Hidden",
+                "Hidden::run",
+                "Worker",
+                "<Worker as Hidden>",
+                "<Worker as Hidden>::run",
+            ] {
+                assert_eq!(
+                    a.nodes.contains_key(&node_key("m.rs", name)),
+                    include_tests,
+                    "{name}"
+                );
+            }
+            assert_eq!(
+                a.nodes[&node_key("m.rs", "live")].status,
+                Status::BodyChanged
+            );
+        }
     }
 }
