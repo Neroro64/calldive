@@ -28,6 +28,13 @@ pub struct DiffLine {
 /// Unified diff of one function's source between the two revisions.
 pub fn fn_diff(base_body: Option<&str>, head_body: Option<&str>) -> Vec<DiffLine> {
     match (base_body, head_body) {
+        (Some(b), Some(h)) if b == h => h
+            .lines()
+            .map(|line| DiffLine {
+                sign: Sign::Same,
+                text: line.to_string(),
+            })
+            .collect(),
         (Some(b), Some(h)) => {
             let diff = TextDiff::from_lines(b, h);
             let mut out = Vec::new();

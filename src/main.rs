@@ -1,4 +1,5 @@
 mod analysis;
+mod cache;
 mod contracts;
 mod diffview;
 mod git;
@@ -83,25 +84,58 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let (files, extra_files) = gather_sources(
-        &repo,
-        &changes,
-        &base_rev,
-        head_rev.as_deref(),
-        &base,
-        &head,
-    )?;
-    if files.is_empty() {
-        println!("changed files, but none in a supported language (Rust, Python, TypeScript/TSX, JavaScript/JSX, Go, C#, C, C++)");
-        return Ok(());
-    }
-
-    let inputs = Inputs {
-        files,
-        extra_head: extra_files,
-        include_tests: args.tests,
+    let cache = match cache::Cache::new(&repo, &changes, &base_rev, head_rev.as_deref(), args.tests) {
+        Ok(cache) => Some(cache),
+        Err(error) => {
+            eprintln!("warning: analysis cache unavailable: {error:#}");
+            None
+        }
     };
-    let a = analysis::analyze(&inputs);
+    let cached = cache.as_ref().and_then(|cache| match cache.load() {
+        Ok(analysis) => analysis,
+        Err(error) => {
+            eprintln!("warning: ignoring analysis cache: {error:#}");
+            None
+        }
+    });
+    let a = if let Some(analysis) = cached {
+        eprintln!("using cached analysis");
+        analysis
+    } else {
+        let (files, extra_files) = gather_sources(
+            &repo,
+            &changes,
+            &base_rev,
+            head_rev.as_deref(),
+            &base,
+            &head,
+        )?;
+        if files.is_empty() {
+            println!("changed files, but none in a supported language (Rust, Python, TypeScript/TSX, JavaScript/JSX, Go, C#, C, C++)");
+            return Ok(());
+        }
+        let analysis = analysis::analyze(&Inputs {
+            files,
+            extra_head: extra_files,
+            include_tests: args.tests,
+        });
+        if let Some(cache) = &cache {
+            let save = || -> Result<()> {
+                let current_changes = repo.changed_files(&base_rev, head_rev.as_deref())?;
+                let current = cache::Cache::new(
+                    &repo, &current_changes, &base_rev, head_rev.as_deref(), args.tests,
+                )?;
+                if cache.same_snapshot(&current) {
+                    cache.store(&analysis)?;
+                }
+                Ok(())
+            };
+            if let Err(error) = save() {
+                eprintln!("warning: could not save analysis cache: {error:#}");
+            }
+        }
+        analysis
+    };
 
     // roots
     let roots: Vec<String> = match &args.entry {

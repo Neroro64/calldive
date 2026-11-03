@@ -91,7 +91,7 @@ thread_local! {
     static PARSERS: RefCell<HashMap<Lang, Parser>> = RefCell::new(HashMap::new());
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum SymbolKind {
     Function,
     Declaration,

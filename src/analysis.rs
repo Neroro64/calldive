@@ -6,7 +6,7 @@ use crate::contracts::{ContractFile, ContractGraph};
 use crate::syntax::{self, CallSite, FnDef, Lang, SymbolKind};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Status {
     Added,
     Removed,
@@ -43,7 +43,7 @@ impl Status {
 
 /// A function location in one revision. Rows are zero-based, end exclusive;
 /// `file` is an identity path in the corresponding Analysis source map.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Span {
     pub file: String,
     pub start_row: usize,
@@ -52,7 +52,7 @@ pub struct Span {
     pub end_byte: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Node {
     pub key: String,
     pub file: String,
@@ -76,6 +76,7 @@ pub fn node_key(file: &str, name: &str) -> String {
     format!("{file}::{name}")
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct Analysis {
     pub nodes: HashMap<String, Node>,
     pub entry_points: Vec<String>,

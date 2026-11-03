@@ -739,6 +739,40 @@ mod tests {
     }
 
     #[test]
+    fn unchanged_callee_shows_complete_source_in_gray() {
+        let source = "fn target() {\r\n    let one = 1;\r\n    let two = 2;\r\n    let three = 3;\r\n    let four = 4;\r\n    let five = 5;\r\n    let six = 6;\r\n    let seven = 7;\r\n    let eight = 8;\r\n    println!(\"{one} {two} {three} {four} {five} {six} {seven} {eight}\");\r\n}";
+        let base = format!("fn caller() {{ target(); }}\r\n{source}\r\n");
+        let head = base.replace("target();", "target(); target();");
+        let a = analyze(&base, &head);
+        let mut app = App::new(
+            &a,
+            vec![analysis::node_key("src/lib.rs", "caller")],
+            false,
+        );
+        app.handle_key(KeyCode::Down);
+        assert_eq!(
+            app.selected_key(),
+            Some(&analysis::node_key("src/lib.rs", "target"))
+        );
+        assert_eq!(a.nodes[app.selected_key().unwrap()].status, Status::Unchanged);
+        let body_start = app
+            .detail
+            .iter()
+            .position(|line| plain(line).is_empty())
+            .unwrap()
+            + 1;
+        let body = &app.detail[body_start..];
+        let actual: Vec<_> = body.iter().map(plain).collect();
+        let expected: Vec<_> = source.lines().map(|line| format!("  {line}")).collect();
+        assert_eq!(actual, expected);
+        for line in body {
+            for span in &line.spans {
+                assert_eq!(span.style.fg, Some(Color::DarkGray));
+            }
+        }
+    }
+
+    #[test]
     fn shifted_function_diff_uses_each_revision_span() {
         let base = "fn target() {\n    let z = 3;\n}\n";
         let head = "// one\n// two\n// three\nfn target() {\n    let z = 4;\n}\n";
@@ -747,6 +781,64 @@ mod tests {
         let lines: Vec<String> = app.detail.iter().map(plain).collect();
         assert!(lines.iter().any(|line| line == "-     let z = 3;"));
         assert!(lines.iter().any(|line| line == "+     let z = 4;"));
+    }
+
+    #[test]
+    fn added_file_symbols_render_complete_head_source_with_plus_markers() {
+        for (path, prefix, source, suffix, name) in [
+            ("added.rs", "// café\r\n", "fn target() {\r\n    println!(\"café\");\r\n}", "", "target"),
+            ("added.py", "# café\r\n", "def target():\r\n    return \"café\"", "", "target"),
+            ("added.ts", "// café\r\n", "function target() {\r\n    return \"café\";\r\n}", "", "target"),
+            ("added.tsx", "// café\r\n", "function target() {\r\n    return <span>café</span>;\r\n}", "", "target"),
+            ("added.js", "// café\r\n", "function target() {\r\n    return \"café\";\r\n}", "", "target"),
+            ("added.go", "package added\r\n// café\r\n", "func target() string {\r\n    return \"café\"\r\n}", "", "target"),
+            ("added.cs", "// café\r\nclass Added {\r\n", "string Target() {\r\n    return \"café\";\r\n}", "\r\n}", "Added::Target"),
+            ("declaration.cs", "// café\r\ninterface Added {\r\n", "string Target();", "\r\n}", "Added::Target"),
+            ("type.cs", "// café\r\n", "class Added", " {\r\n    string Target() => \"café\";\r\n}", "Added"),
+            ("added.c", "// café\r\n", "const char *target(void) {\r\n    return \"café\";\r\n}", "", "target"),
+            ("added.cpp", "// café\r\n", "const char *target() {\r\n    return \"café\";\r\n}", "", "target"),
+        ] {
+            let a = analysis::analyze(&analysis::Inputs {
+                files: vec![(path.into(), None, Some(format!("{prefix}{source}{suffix}")))],
+                extra_head: vec![],
+                include_tests: false,
+            });
+            let app = App::new(&a, vec![analysis::node_key(path, name)], false);
+            let actual: Vec<_> = app
+                .detail
+                .iter()
+                .map(plain)
+                .filter(|line| line.starts_with("+ ") || line.starts_with("- "))
+                .collect();
+            let expected: Vec<_> = source.lines().map(|line| format!("+ {line}")).collect();
+            assert_eq!(actual, expected, "{path}");
+        }
+    }
+
+    #[test]
+    fn added_method_in_existing_file_renders_only_its_complete_head_source() {
+        let path = "ErrorRecordFilter.cs";
+        let base = "namespace Example;\r\nclass ErrorRecordFilter {\r\n    string Existing() => \"café\";\r\n}\r\n";
+        let source = "private static string GetErrorSummaryFallback(string errorSummary)\r\n    {\r\n        int end = errorSummary.AsSpan().IndexOfAny(';', '\\r', '\\n');\r\n\r\n        return (end >= 0 ? errorSummary[..end] : errorSummary).Trim();\r\n    }";
+        let head = base.replace("\r\n}\r\n", &format!("\r\n    {source}\r\n}}\r\n"));
+        let a = analysis::analyze(&analysis::Inputs {
+            files: vec![(path.into(), Some(base.into()), Some(head))],
+            extra_head: vec![],
+            include_tests: false,
+        });
+        let app = App::new(
+            &a,
+            vec![analysis::node_key(path, "Example::ErrorRecordFilter::GetErrorSummaryFallback")],
+            false,
+        );
+        let actual: Vec<_> = app
+            .detail
+            .iter()
+            .map(plain)
+            .filter(|line| line.starts_with("+ ") || line.starts_with("- "))
+            .collect();
+        let expected: Vec<_> = source.lines().map(|line| format!("+ {line}")).collect();
+        assert_eq!(actual, expected);
     }
 
     #[test]

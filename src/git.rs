@@ -78,6 +78,13 @@ impl GitRepo {
         Ok(sha.to_string())
     }
 
+    /// Git resolves this separately for each linked worktree.
+    pub fn cache_dir(&self) -> Result<PathBuf> {
+        let out = self.run(&["rev-parse", "--path-format=absolute", "--git-path", "calldive"])?;
+        let path = String::from_utf8(out).context("git returned a non-UTF-8 cache path")?;
+        Ok(PathBuf::from(path.trim_end_matches(['\r', '\n'])))
+    }
+
     /// Includes staged, unstaged, and untracked files for a worktree head.
     /// Commit arguments must already be resolved to SHAs.
     pub fn changed_files(&self, base: &str, head: Option<&str>) -> Result<Vec<FileChange>> {

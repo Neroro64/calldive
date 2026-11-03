@@ -90,6 +90,25 @@ use `Shift+H` to reveal the full qualification.
 In the detail pane, diff markers are
 `+` added lines, `-` removed lines, and a space for context; base and head line
 numbers refer to their own revisions.
+Unchanged symbols show their complete source in gray, including callees reached
+from changed callers. Changed symbols retain the contextual diff view.
+
+## Analysis cache
+
+The most recent analysis is saved in `calldive/analysis.json` under the
+repository's Git directory (each linked worktree has its own cache). Rerunning
+the same review prints `using cached analysis` to stderr and skips source
+gathering, parsing, and graph construction. JSON stdout remains a single document.
+
+Cache validity includes resolved revisions, `--tests`, the executable, changed
+file identities, and the contents of all supported tracked and changed/untracked
+worktree sources, including unchanged caller candidates. Same-size edits,
+additions, and deletions invalidate the cache; presentation options such as
+`--entry`, `--all`, `--focus`, `--dump`, and `--json` reuse it. Revision source
+text is retained so cached reviews still show added/removed symbol content.
+Corrupt or unwritable caches produce a warning and do not prevent review.
+To clear the cache, remove that `analysis.json` file. Locate its directory with
+`git rev-parse --path-format=absolute --git-path calldive`.
 
 ## How it works
 

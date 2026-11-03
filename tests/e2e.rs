@@ -1181,3 +1181,52 @@ fn trait_rename_keeps_empty_implementation_header_history() {
     assert_eq!(header["base"]["start"], 3);
     assert_eq!(header["head"]["start"], 3);
 }
+
+#[test]
+fn cached_review_tracks_same_size_edits_and_untracked_file_lifecycle() {
+    let repo = Repo::new("cache-worktree");
+    let base = "fn run() { alpha(); }\nfn alpha() {}\nfn bravo() {}\nfn delta() {}\n";
+    repo.write("src/lib.rs", base);
+    repo.commit_all("base");
+    repo.write("src/lib.rs", &base.replace("run() { alpha", "run() { bravo"));
+    let cold = json_review(&repo);
+    assert_eq!(json_review(&repo), cold);
+    assert_eq!(json_node(&cold, "run")["callees"], serde_json::json!(["src/lib.rs::bravo"]));
+
+    repo.write("src/lib.rs", &base.replace("run() { alpha", "run() { delta"));
+    let edited = json_review(&repo);
+    assert_eq!(json_node(&edited, "run")["callees"], serde_json::json!(["src/lib.rs::delta"]));
+    repo.write("src/fresh.rs", "fn fresh() { run(); }\n");
+    let added = json_review(&repo);
+    assert_eq!(json_node(&added, "fresh")["status"], "added");
+    assert_eq!(json_node(&added, "fresh")["callees"], serde_json::json!(["src/lib.rs::run"]));
+    assert_eq!(json_review(&repo), added);
+    fs::remove_file(repo.root.join("src/fresh.rs")).unwrap();
+    assert_eq!(json_review(&repo), edited);
+}
+
+#[test]
+fn cached_review_respects_revision_and_test_selection_and_recovers_corruption() {
+    let repo = Repo::new("cache-options");
+    repo.write("src/lib.rs", "fn stable() {}\n");
+    repo.commit_all("base");
+    repo.write("src/lib.rs", "fn stable() {}\nfn added() {}\n#[test] fn check() { added(); }\n");
+    repo.commit_all("head");
+    let read = |args: &[&str]| {
+        let (code, out, err) = repo.run(args);
+        assert_eq!(code, 0, "{err}");
+        serde_json::from_str::<serde_json::Value>(&out).unwrap()
+    };
+    let regular = read(&["HEAD~1", "HEAD", "--json"]);
+    assert_eq!(regular["summary"]["added"], 1);
+    assert_eq!(read(&["HEAD~1", "HEAD", "--json"]), regular);
+    let tests = read(&["HEAD~1", "HEAD", "--tests", "--json"]);
+    assert_eq!(json_node(&tests, "check")["status"], "added");
+    assert_eq!(tests["summary"]["added"], 2);
+    assert_eq!(read(&["HEAD~1", "HEAD", "--json"]), regular);
+    let reverse = read(&["HEAD", "HEAD~1", "--json"]);
+    assert_eq!(json_node(&reverse, "added")["status"], "removed");
+    fs::write(repo.root.join(".git/calldive/analysis.json"), "{interrupted").unwrap();
+    assert_eq!(read(&["HEAD~1", "HEAD", "--json"]), regular);
+    assert_eq!(read(&["HEAD~1", "HEAD", "--json"]), regular);
+}
