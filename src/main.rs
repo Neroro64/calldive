@@ -20,12 +20,13 @@ use std::collections::{HashMap, HashSet};
 #[derive(Parser, Debug)]
 #[command(name = "calldive", version, about)]
 struct Args {
-    /// base revision (default HEAD~1)
+    /// source / base revision (or interactive selector in TUI mode when omitted)
+    #[arg(allow_hyphen_values = false)]
     base: Option<String>,
 
-    /// head revision, or "worktree" (default worktree)
+    /// target / head revision, or "worktree" (default: worktree when source is given)
+    #[arg(allow_hyphen_values = false)]
     head: Option<String>,
-
     /// repository root (default: cwd)
     #[arg(long)]
     repo: Option<String>,
@@ -65,11 +66,22 @@ fn main() -> Result<()> {
         .unwrap_or(cwd);
     let repo = git::GitRepo::open(&repo_path)?;
 
-    let base = args.base.clone().unwrap_or_else(|| "HEAD~1".to_string());
-    let head = args
-        .head
-        .clone()
-        .unwrap_or_else(|| git::WORKTREE.to_string());
+    let is_interactive_tui =
+        args.base.is_none() && args.head.is_none() && !args.dump && !args.json;
+    let (base, head) = if is_interactive_tui {
+        let candidates = repo.rev_candidates()?;
+        match ui::select_revisions(candidates)? {
+            Some(pair) => pair,
+            None => return Ok(()),
+        }
+    } else {
+        let base = args.base.clone().unwrap_or_else(|| "HEAD~1".to_string());
+        let head = args
+            .head
+            .clone()
+            .unwrap_or_else(|| git::WORKTREE.to_string());
+        (base, head)
+    };
     if git::is_worktree(&base) {
         bail!("base ref '{base}' cannot be worktree; pass a commit revision as base");
     }

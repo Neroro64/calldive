@@ -8,9 +8,11 @@ use std::io::{BufReader, BufWriter, Write};
 use std::path::PathBuf;
 
 // Changing the executable also invalidates entries, including local rebuilds.
-const FORMAT: &[u8] = b"calldive-analysis-v1";
+const FORMAT: &[u8] = b"calldive-analysis-v2";
+const MAX_ENTRIES: usize = 16;
 
 pub struct Cache {
+    directory: PathBuf,
     path: PathBuf,
     key: String,
 }
@@ -37,6 +39,10 @@ impl Cache {
     ) -> Result<Self> {
         let mut hash = blake3::Hasher::new();
         field(&mut hash, FORMAT);
+        // Include resolved commit IDs of the compared pair and current HEAD so
+        // moving HEAD or changing either revision's commit ID invalidates entries.
+        let current_head = repo.resolve_commit("HEAD").unwrap_or_default();
+        field(&mut hash, current_head.as_bytes());
         field(&mut hash, base.as_bytes());
         field(&mut hash, head.unwrap_or(git::WORKTREE).as_bytes());
         field(&mut hash, &[u8::from(include_tests)]);
@@ -72,13 +78,20 @@ impl Cache {
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                         field(&mut hash, b"missing");
                     }
-                    Err(error) => return Err(error).with_context(|| format!("opening worktree source '{path}'")),
+                    Err(error) => {
+                        return Err(error)
+                            .with_context(|| format!("opening worktree source '{path}'"))
+                    }
                 }
             }
         }
+        let key = hash.finalize().to_hex().to_string();
+        let directory = repo.cache_dir()?;
+        let path = directory.join(format!("analysis-{}.json", &key[..32]));
         Ok(Self {
-            path: repo.cache_dir()?.join("analysis.json"),
-            key: hash.finalize().to_hex().to_string(),
+            directory,
+            path,
+            key,
         })
     }
 
@@ -88,8 +101,8 @@ impl Cache {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error).context("opening analysis cache"),
         };
-        let entry: Entry = serde_json::from_reader(BufReader::new(file))
-            .context("reading analysis cache")?;
+        let entry: Entry =
+            serde_json::from_reader(BufReader::new(file)).context("reading analysis cache")?;
         Ok((entry.key == self.key).then_some(entry.analysis))
     }
 
@@ -99,21 +112,66 @@ impl Cache {
     }
 
     pub fn store(&self, analysis: &Analysis) -> Result<()> {
-        let directory = self.path.parent().context("cache directory missing")?;
-        fs::create_dir_all(directory).context("creating analysis cache directory")?;
-        let temporary = directory.join(format!("analysis-{}.tmp", std::process::id()));
+        fs::create_dir_all(&self.directory).context("creating analysis cache directory")?;
+        let temporary = self.directory.join(format!(
+            "analysis-{}-{}.tmp",
+            &self.key[..16],
+            std::process::id()
+        ));
         let result = (|| -> Result<()> {
             let mut writer = BufWriter::new(File::create(&temporary)?);
-            serde_json::to_writer(&mut writer, &EntryRef { key: &self.key, analysis })?;
+            serde_json::to_writer(
+                &mut writer,
+                &EntryRef {
+                    key: &self.key,
+                    analysis,
+                },
+            )?;
             writer.flush()?;
             drop(writer);
+            if self.path.exists() {
+                let _ = fs::remove_file(&self.path);
+            }
             fs::rename(&temporary, &self.path)?;
             Ok(())
         })();
         if result.is_err() {
-            let _ = fs::remove_file(temporary);
+            let _ = fs::remove_file(&temporary);
         }
+        self.prune_stale();
         result.context("writing analysis cache")
+    }
+
+    fn prune_stale(&self) {
+        let Ok(entries) = fs::read_dir(&self.directory) else {
+            return;
+        };
+        let mut cached_files = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if name == "analysis.json" {
+                let _ = fs::remove_file(&path);
+                continue;
+            }
+            if name.starts_with("analysis-") && name.ends_with(".json") && path != self.path {
+                let modified = entry
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                cached_files.push((modified, path));
+            }
+        }
+        if cached_files.len() < MAX_ENTRIES {
+            return;
+        }
+        cached_files.sort_by_key(|(modified, _)| *modified);
+        let excess = cached_files.len() + 1 - MAX_ENTRIES;
+        for (_, path) in cached_files.into_iter().take(excess) {
+            let _ = fs::remove_file(path);
+        }
     }
 }
 
