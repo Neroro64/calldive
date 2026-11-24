@@ -1,8 +1,12 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
+use std::collections::HashSet;
+use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::thread::JoinHandle;
+
+pub const BINARY_SOURCE_PREFIX: &str = "Binary file: ";
 
 /// Thin wrapper over git plumbing, executed in the repo working dir.
 pub struct GitRepo {
@@ -16,12 +20,17 @@ pub struct FileChange {
     pub old_path: Option<String>,
     /// A = added, M = modified, D = deleted, R = renamed, C = copied
     pub status: char,
+    pub base_oid: Option<String>,
+    pub base_submodule: bool,
+    pub head_oid: Option<String>,
+    pub head_submodule: bool,
 }
 
 pub struct Blob {
     pub path: String,
     pub oid: String,
     pub size: usize,
+    pub source: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,9 +94,28 @@ impl GitRepo {
         Ok(sha.to_string())
     }
 
+    pub fn resolve_base(&self, rev: &str) -> Result<String> {
+        match self.resolve_commit(rev) {
+            Ok(sha) => Ok(sha),
+            Err(_) if rev == "HEAD" => {
+                let output = self.run(&["hash-object", "-t", "tree", "-w", "--stdin"])?;
+                Ok(String::from_utf8(output)
+                    .context("git returned an invalid empty tree ID")?
+                    .trim()
+                    .to_string())
+            }
+            Err(error) => Err(error).with_context(|| format!("base ref '{rev}' does not resolve")),
+        }
+    }
+
     /// Git resolves this separately for each linked worktree.
     pub fn cache_dir(&self) -> Result<PathBuf> {
-        let out = self.run(&["rev-parse", "--path-format=absolute", "--git-path", "calldive"])?;
+        let out = self.run(&[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "calldive",
+        ])?;
         let path = String::from_utf8(out).context("git returned a non-UTF-8 cache path")?;
         Ok(PathBuf::from(path.trim_end_matches(['\r', '\n'])))
     }
@@ -97,7 +125,8 @@ impl GitRepo {
     pub fn changed_files(&self, base: &str, head: Option<&str>) -> Result<Vec<FileChange>> {
         let mut args = vec![
             "diff",
-            "--name-status",
+            "--raw",
+            "--no-abbrev",
             "-z",
             "-M",
             "-C",
@@ -113,8 +142,23 @@ impl GitRepo {
         let records = nul_records(&out)?;
         let mut records = records.into_iter();
         let mut files = Vec::new();
-        while let Some(status) = records.next() {
-            let status = status.first().copied().context("empty git diff status")? as char;
+        while let Some(meta) = records.next() {
+            let meta_str = std::str::from_utf8(meta).context("invalid git diff --raw metadata")?;
+            let meta_fields: Vec<&str> = meta_str
+                .trim_start_matches(':')
+                .split_ascii_whitespace()
+                .collect();
+            if meta_fields.len() < 5 {
+                bail!("unexpected git diff --raw metadata: {meta_str}");
+            }
+            let base_mode = meta_fields[0];
+            let head_mode = meta_fields[1];
+            let base_oid_raw = meta_fields[2];
+            let head_oid_raw = meta_fields[3];
+            let status = meta_fields[4]
+                .bytes()
+                .next()
+                .context("empty git diff status")? as char;
             let first = records.next().context("git diff omitted a file path")?;
             let (path, old_path) = if matches!(status, 'R' | 'C') {
                 let new = records
@@ -124,21 +168,35 @@ impl GitRepo {
             } else {
                 (decode_path(first), None)
             };
+            let non_zero = |oid: &str| !oid.bytes().all(|b| b == b'0');
             files.push(FileChange {
                 path,
                 old_path,
                 status,
+                base_oid: non_zero(base_oid_raw).then(|| base_oid_raw.to_string()),
+                base_submodule: base_mode == "160000",
+                head_oid: (head.is_some() && non_zero(head_oid_raw)).then(|| head_oid_raw.to_string()),
+                head_submodule: head_mode == "160000",
             });
         }
         if head.is_none() {
-            let mut paths: std::collections::HashSet<String> =
-                files.iter().map(|file| file.path.clone()).collect();
+            let mut paths: HashSet<String> = files.iter().map(|file| file.path.clone()).collect();
             for path in self.untracked_files()? {
+                if let Some(deleted) = files
+                    .iter_mut()
+                    .find(|file| file.path == path && file.status == 'D')
+                {
+                    deleted.status = 'M';
+                }
                 if paths.insert(path.clone()) {
                     files.push(FileChange {
                         path,
                         old_path: None,
                         status: 'A',
+                        base_oid: None,
+                        base_submodule: false,
+                        head_oid: None,
+                        head_submodule: false,
                     });
                 }
             }
@@ -149,7 +207,26 @@ impl GitRepo {
 
     pub fn read_worktree(&self, path: &str) -> Result<String> {
         let full_path = self.root.join(path);
-        let bytes = std::fs::read(&full_path)
+        let metadata = fs::symlink_metadata(&full_path)
+            .with_context(|| format!("reading worktree metadata {}", full_path.display()))?;
+        if metadata.file_type().is_symlink() {
+            return Ok(fs::read_link(&full_path)?.to_string_lossy().into_owned());
+        }
+        if metadata.is_dir() {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(&full_path)
+                .args(["rev-parse", "--verify", "HEAD"])
+                .output()?;
+            if out.status.success() {
+                return Ok(format!(
+                    "Git submodule commit {}\n",
+                    String::from_utf8_lossy(&out.stdout).trim()
+                ));
+            }
+            return Ok("Git submodule (unavailable worktree commit)\n".to_string());
+        }
+        let bytes = fs::read(&full_path)
             .with_context(|| format!("reading worktree file {}", full_path.display()))?;
         Ok(decode_source(bytes))
     }
@@ -159,9 +236,110 @@ impl GitRepo {
         Ok(nul_records(&out)?.into_iter().map(decode_path).collect())
     }
 
-    fn untracked_files(&self) -> Result<Vec<String>> {
+    pub fn untracked_files(&self) -> Result<Vec<String>> {
         let out = self.run(&["ls-files", "-z", "--others", "--exclude-standard", "--"])?;
         Ok(nul_records(&out)?.into_iter().map(decode_path).collect())
+    }
+
+    /// Dirty tracked paths relative to HEAD (staged or unstaged).
+    pub fn dirty_tracked_files(&self) -> Result<Vec<String>> {
+        let Ok(head) = self.resolve_commit("HEAD") else {
+            return self.tracked_files();
+        };
+        let out = self.run(&["diff-index", "-z", "--name-only", "--end-of-options", &head, "--"])?;
+        Ok(nul_records(&out)?.into_iter().map(decode_path).collect())
+    }
+
+    /// Fast candidate file prefilter via `git grep` at `rev` (or worktree when `None`).
+    /// Returns matching repository-relative paths, or `None` if `git grep` cannot run.
+    pub fn grep_candidate_files(
+        &self,
+        rev: Option<&str>,
+        terms: &[String],
+        pathspecs: &[&str],
+    ) -> Result<Option<HashSet<String>>> {
+        if terms.is_empty() {
+            return Ok(Some(HashSet::new()));
+        }
+        let mut cmd = Command::new("git");
+        cmd.arg("-C")
+            .arg(&self.root)
+            .args([
+                "-c",
+                "core.quotepath=false",
+                "grep",
+                "--full-name",
+                "-l",
+                "-z",
+                "-w",
+                "-F",
+                "-f",
+                "-",
+            ]);
+        if let Some(rev) = rev {
+            cmd.arg(rev);
+        }
+        cmd.arg("--");
+        cmd.args(pathspecs);
+        let mut child = match cmd
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(_) => return Ok(None),
+        };
+        let stdin = child
+            .stdin
+            .take()
+            .context("git grep stdin unavailable")?;
+        let mut stdout = child
+            .stdout
+            .take()
+            .context("git grep stdout unavailable")?;
+        let mut stderr = child
+            .stderr
+            .take()
+            .context("git grep stderr unavailable")?;
+        let (out, _err, status) = std::thread::scope(|scope| -> Result<(Vec<u8>, Vec<u8>, std::process::ExitStatus)> {
+            let writer = scope.spawn(move || -> std::io::Result<()> {
+                let mut stdin = stdin;
+                for term in terms {
+                    writeln!(stdin, "{term}")?;
+                }
+                stdin.flush()
+            });
+            let err_reader = scope.spawn(move || -> std::io::Result<Vec<u8>> {
+                let mut buf = Vec::new();
+                stderr.read_to_end(&mut buf)?;
+                Ok(buf)
+            });
+            let mut out_buf = Vec::new();
+            stdout.read_to_end(&mut out_buf)?;
+            let _ = writer.join();
+            let err_buf = err_reader
+                .join()
+                .map_err(|_| anyhow::anyhow!("git grep stderr reader panicked"))??;
+            let status = child.wait()?;
+            Ok((out_buf, err_buf, status))
+        })?;
+        match status.code() {
+            Some(0) => {}
+            Some(1) => return Ok(Some(HashSet::new())),
+            _ => return Ok(None),
+        }
+        let prefix = rev.map(|r| format!("{r}:"));
+        let mut paths = HashSet::new();
+        for record in nul_records(&out)? {
+            let decoded = decode_path(record);
+            let path = match &prefix {
+                Some(p) => decoded.strip_prefix(p.as_str()).unwrap_or(&decoded).to_string(),
+                None => decoded,
+            };
+            paths.insert(path);
+        }
+        Ok(Some(paths))
     }
 
     /// Blob IDs avoid the line-oriented batch protocol's restrictions on paths.
@@ -180,24 +358,31 @@ impl GitRepo {
             if fields.len() != 4 {
                 bail!("git ls-tree returned invalid metadata: {metadata}");
             }
-            if fields[1] != "blob" {
+            if !matches!(fields[1], "blob" | "commit") {
                 continue;
             }
+            let submodule = fields[1] == "commit";
             blobs.push(Blob {
                 path: decode_path(&record[tab + 1..]),
                 oid: fields[2].to_string(),
-                size: fields[3]
-                    .parse()
-                    .context("git ls-tree returned an invalid blob size")?,
+                size: if submodule {
+                    0
+                } else {
+                    fields[3]
+                        .parse()
+                        .context("git ls-tree returned an invalid blob size")?
+                },
+                source: submodule.then(|| format!("Git submodule commit {}\n", fields[2])),
             });
         }
         Ok(blobs)
     }
+
     /// Discover revision candidates for the interactive TUI selector:
     /// worktree, HEAD, HEAD~N, local/remote branches, and tags.
     pub fn rev_candidates(&self) -> Result<Vec<RevCandidate>> {
         let mut candidates = Vec::new();
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = HashSet::new();
 
         let worktree_detail = match self.resolve_commit("HEAD") {
             Ok(head_sha) => match self.changed_files(&head_sha, None) {
@@ -275,7 +460,6 @@ impl GitRepo {
 
         Ok(candidates)
     }
-
 
     /// Keep one batch process alive for both changed sources and caller candidates.
     pub fn with_blobs<T>(&self, read: impl FnOnce(&mut BlobReader) -> Result<T>) -> Result<T> {
@@ -443,8 +627,13 @@ fn decode_path(bytes: &[u8]) -> String {
 }
 
 pub fn decode_source(bytes: Vec<u8>) -> String {
-    // Reuse valid UTF-8 buffers; invalid bytes take the same lossy path for
-    // worktree files and git blobs.
+    if bytes.contains(&0) {
+        return format!(
+            "{BINARY_SOURCE_PREFIX}{} bytes (blake3 {})\n",
+            bytes.len(),
+            blake3::hash(&bytes)
+        );
+    }
     let mut source = match String::from_utf8(bytes) {
         Ok(source) => source,
         Err(error) => String::from_utf8_lossy(error.as_bytes()).into_owned(),
@@ -476,7 +665,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sources_decode_identically_and_strip_only_a_leading_bom() {
+    fn sources_decode_lossily_strip_bom_and_summarize_nul_binary() {
         assert_eq!(
             decode_source(b"\xef\xbb\xbffn run() {}".to_vec()),
             "fn run() {}"
@@ -485,6 +674,7 @@ mod tests {
             decode_source(b"// caf\xe9\nfn run() {}".to_vec()),
             "// caf\u{fffd}\nfn run() {}"
         );
+        assert!(decode_source(vec![0, 1, 2]).starts_with(BINARY_SOURCE_PREFIX));
         assert_eq!(decode_source(b"x\xef\xbb\xbf".to_vec()), "x\u{feff}");
     }
 }

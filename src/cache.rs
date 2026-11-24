@@ -1,15 +1,22 @@
 //! Cache the complete review model, including revision source text.
 
-use crate::{analysis::Analysis, git, syntax};
+use crate::{analysis::Analysis, git};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Write};
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 // Changing the executable also invalidates entries, including local rebuilds.
-const FORMAT: &[u8] = b"calldive-analysis-v2";
+const FORMAT: &[u8] = b"calldive-analysis-v4";
 const MAX_ENTRIES: usize = 16;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CacheStatus {
+    Hit,
+    Miss,
+}
 
 pub struct Cache {
     directory: PathBuf,
@@ -46,41 +53,41 @@ impl Cache {
         field(&mut hash, base.as_bytes());
         field(&mut hash, head.unwrap_or(git::WORKTREE).as_bytes());
         field(&mut hash, &[u8::from(include_tests)]);
-        let executable = std::env::current_exe().context("locating calldive executable")?;
-        let mut binary = File::open(executable).context("reading calldive executable")?;
-        // Fixed-size digest separates executable bytes from the other fields.
-        let mut executable_hash = blake3::Hasher::new();
-        executable_hash.update_reader(&mut binary)?;
-        field(&mut hash, executable_hash.finalize().as_bytes());
+        field(&mut hash, executable_digest()?);
         for change in changes {
             field(&mut hash, &[change.status as u8]);
             field(&mut hash, change.path.as_bytes());
-            field(&mut hash, change.old_path.as_deref().unwrap_or("").as_bytes());
+            field(
+                &mut hash,
+                change.old_path.as_deref().unwrap_or("").as_bytes(),
+            );
         }
         if head.is_none() {
-            // Include unchanged callers as well as edited and untracked sources.
-            // Hash contents, not timestamps: same-size edits must invalidate too.
-            let mut paths = repo.tracked_files()?;
+            // `current_head` already locks clean tracked files at HEAD. Hash only
+            // changed, dirty-tracked, and untracked worktree files so cache hits
+            // do not read thousands of clean tracked files from disk.
+            let mut paths = repo.dirty_tracked_files()?;
+            paths.extend(repo.untracked_files()?);
             paths.extend(changes.iter().map(|change| change.path.clone()));
-            paths.retain(|path| syntax::lang_for_path(path).is_some());
             paths.sort();
             paths.dedup();
             for path in paths {
                 field(&mut hash, path.as_bytes());
-                match File::open(repo.root.join(&path)) {
-                    Ok(mut file) => {
+                match repo.read_worktree(&path) {
+                    Ok(source) => {
                         field(&mut hash, b"present");
-                        let mut content = blake3::Hasher::new();
-                        content.update_reader(&mut file)
-                            .with_context(|| format!("hashing worktree source '{path}'"))?;
-                        field(&mut hash, content.finalize().as_bytes());
+                        field(&mut hash, blake3::hash(source.as_bytes()).as_bytes());
                     }
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    Err(error)
+                        if error
+                            .downcast_ref::<std::io::Error>()
+                            .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+                    {
                         field(&mut hash, b"missing");
                     }
                     Err(error) => {
                         return Err(error)
-                            .with_context(|| format!("opening worktree source '{path}'"))
+                            .with_context(|| format!("hashing worktree source '{path}'"));
                     }
                 }
             }
@@ -173,6 +180,20 @@ impl Cache {
             let _ = fs::remove_file(path);
         }
     }
+}
+
+fn executable_digest() -> Result<&'static [u8; 32]> {
+    static DIGEST: OnceLock<[u8; 32]> = OnceLock::new();
+    if let Some(digest) = DIGEST.get() {
+        return Ok(digest);
+    }
+    let executable = std::env::current_exe().context("locating calldive executable")?;
+    let mut binary = File::open(executable).context("reading calldive executable")?;
+    let mut executable_hash = blake3::Hasher::new();
+    executable_hash.update_reader(&mut binary)?;
+    let digest = *executable_hash.finalize().as_bytes();
+    let _ = DIGEST.set(digest);
+    Ok(DIGEST.get().expect("executable digest initialized"))
 }
 
 fn field(hash: &mut blake3::Hasher, bytes: &[u8]) {

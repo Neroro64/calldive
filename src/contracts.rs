@@ -235,24 +235,27 @@ impl ContractGraph {
         let caller_scope = self.scopes.get(file)?.get(function)?;
         // Rust's fully qualified trait syntax must not select an inherent method
         // or an implementation of another trait with the same method name.
-        if family == Lang::Rust {
-            if let Some((scope, ty, tr)) = trait_impl(receiver) {
-                let scope = if scope.is_empty() {
-                    caller_scope.as_str()
-                } else {
-                    scope
-                };
-                let owner = self.resolve_type(file, family, ty, scope)?;
-                let contract = self.resolve_type(file, family, tr, scope)?;
-                if owner != contract && !self.reachable(owner, false).contains(&contract) {
-                    return Some(Vec::new());
-                }
-                return Some(self.lookup_members(owner, leaf(name), Some(contract)));
+        if family == Lang::Rust
+            && let Some((scope, ty, tr)) = trait_impl(receiver)
+        {
+            let scope = if scope.is_empty() {
+                caller_scope.as_str()
+            } else {
+                scope
+            };
+            let owner = self.resolve_type(file, family, ty, scope)?;
+            let contract = self.resolve_type(file, family, tr, scope)?;
+            if owner != contract && !self.reachable(owner, false).contains(&contract) {
+                return Some(Vec::new());
             }
+            return Some(self.lookup_members(owner, leaf(name), Some(contract)));
         }
         let owner = self.resolve_type(file, family, receiver, caller_scope)?;
         let name = leaf(name);
         let mut targets = self.lookup_members(owner, name, None);
+        if targets.is_empty() && name == leaf(&self.types[owner].qual) {
+            return Some(vec![self.types[owner].id]);
+        }
         if !dispatch {
             return Some(targets);
         }
@@ -619,7 +622,7 @@ fn is_constructor(family: Lang, name: &str, owner: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::syntax::{parse_file, ParsedFile};
+    use crate::syntax::{ParsedFile, parse_file};
 
     fn graph(parsed: &[(&str, ParsedFile)]) -> ContractGraph {
         ContractGraph::new(
@@ -769,10 +772,12 @@ namespace N { class Worker : IWorker { public void Run() {} } }
             graph.receiver_targets(2, caller(&graph, 2), "IWorker", "Run", true),
             None
         );
-        assert!(graph
-            .receiver_targets(2, caller(&graph, 2), "A.IWorker", "Run", true)
-            .unwrap()
-            .contains(&symbol(&parsed, 0, "A::IWorker::Run")));
+        assert!(
+            graph
+                .receiver_targets(2, caller(&graph, 2), "A.IWorker", "Run", true)
+                .unwrap()
+                .contains(&symbol(&parsed, 0, "A::IWorker::Run"))
+        );
     }
 
     #[test]
@@ -869,10 +874,12 @@ class Child extends A {}
             .unwrap(),
         )];
         let graph = graph(&parsed);
-        assert!(!graph
-            .receiver_targets(0, caller(&graph, 0), "Child", "run", true)
-            .unwrap()
-            .is_empty());
+        assert!(
+            !graph
+                .receiver_targets(0, caller(&graph, 0), "Child", "run", true)
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(
             graph.receiver_targets(0, caller(&graph, 0), "Child", "missing", true),
             Some(Vec::new())
@@ -1123,10 +1130,12 @@ impl Child for Worker {}
         assert!(edge(&graph, symbol(&parsed, 0, "Child"), header));
         assert!(edge(&graph, symbol(&parsed, 0, "Worker"), header));
         assert!(edge(&graph, symbol(&parsed, 0, "Child::defaulted"), header));
-        assert!(graph
-            .receiver_targets(0, caller(&graph, 0), "Child", "run", true)
-            .unwrap()
-            .contains(&symbol(&parsed, 0, "<Worker as Root>::run")));
+        assert!(
+            graph
+                .receiver_targets(0, caller(&graph, 0), "Child", "run", true)
+                .unwrap()
+                .contains(&symbol(&parsed, 0, "<Worker as Root>::run"))
+        );
         assert_eq!(
             graph.receiver_targets(0, caller(&graph, 0), "<Worker as Child>", "defaulted", true),
             Some(vec![symbol(&parsed, 0, "Child::defaulted")])
@@ -1335,9 +1344,11 @@ struct Child : Base { void Run() override {} void Call() { Base::Run(); } };
             graph.receiver_targets(0, function, receiver, &call.name, call.dispatch),
             Some(vec![base])
         );
-        assert!(graph
-            .receiver_targets(0, function, receiver, &call.name, true)
-            .unwrap()
-            .contains(&child));
+        assert!(
+            graph
+                .receiver_targets(0, function, receiver, &call.name, true)
+                .unwrap()
+                .contains(&child)
+        );
     }
 }

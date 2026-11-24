@@ -46,7 +46,6 @@ calldive HEAD --entry 'IWorker'
 calldive HEAD --entry 'IWorker::Run'
 calldive HEAD --entry 'src/x.rs::run'
 calldive HEAD --entry 'x.rs::run'
-# non-interactive review tree or complete machine-readable analysis
 calldive HEAD --dump
 calldive HEAD --json
 # include clean root components / test symbols
@@ -68,12 +67,13 @@ start expanded; `--focus` does not alter dump output.
 JSON is one document with `base`, `head`, `summary` (`added`, `removed`,
 `changed`, `moved`), selected `roots`, all `entry_points`, and `nodes` sorted by
 key. Each node contains `key`, `name`, `file`, `label`, `kind` (`function`,
-`declaration`, `type`), `status` (`added`, `removed`, `changed`, `moved`,
+`declaration`, `type`, `value`, `file`), `role` (`use case`, `data flow`,
+`logic`, `self-contained`), `status` (`added`, `removed`, `changed`, `moved`,
 `unchanged`), nullable `head` and `base` spans (`file`, 1-based inclusive
 `start`/`end`), nullable `moved_from`, `relevant`, `callers`, `external_callers`,
-`callees`, `lost_callees`, `implementations`, and `contracts`. Summary counts
-include all symbol kinds; unchanged implementation context does not add churn.
-
+`callees`, `lost_callees`, `implementations`, `contracts`, `consumers`, and
+`external_consumers`. Summary counts include all symbol kinds; unchanged
+implementation context does not add churn.
 `implementations` and its reverse `contracts` describe type membership, explicit
 inheritance, overrides, and inherited implementations **from either revision**.
 They preserve impact paths when a signature/base-list edit breaks a previous
@@ -83,21 +83,19 @@ edges `(base/head)` and the review tree follows them alongside call edges.
 
 Selector keys (when launched with `calldive`): `j/k` move · `tab`/`h`/`l` switch source/target pane · `enter` diff selected pair · `s` swap source and target · `/` filter list · `i` enter custom revision · `q`/`esc` quit.
 
-Review keys: `j/k` move · `enter`/`l` toggle expansion · `h` collapse the row or its
-nearest expanded ancestor · `x` expand subtree (depth limit 5) · `e` collapse
-to roots · `f` focus relevant branches · `g/G` first/last row (top/bottom in
-details) · `tab` switch pane · `Shift+H`/`Shift+L` scroll the focused panel
-left/right by 8 columns (each panel keeps its own offset) · `q` quit.
-In the diff panel, `Ctrl+D` / `Ctrl+U` scroll down/up by half a visible page,
-stopping at the bottom/top.
-The tree starts scrolled past the first selected symbol's namespace prefix;
-use `Shift+H` to reveal the full qualification.
-In the detail pane, diff markers are
-`+` added lines, `-` removed lines, and a space for context; base and head line
-numbers refer to their own revisions.
-Unchanged symbols show their complete source in gray, including callees reached
-from changed callers. Changed symbols retain the contextual diff view.
+Review keys: `j/k` move · `Ctrl+D`/`Ctrl+U` half-page scroll (in both Call Tree
+and Symbol Diff) · `enter`/`space`/`l` toggle expansion in tree · `h` collapse
+the row or its nearest expanded ancestor · `x` expand subtree (depth limit 5) ·
+`e` collapse to roots · `f` focus relevant branches · `g/G` first/last row
+(top/bottom in details) · `tab` switch pane · `enter`/`space`/`z` expand or
+collapse a folded unchanged section in diff · `Z` toggle expanding all unchanged
+sections · `Shift+H`/`Shift+L` scroll the focused panel left/right by 8 columns ·
+`?` toggle the color legend & keybindings help modal · `q` quit.
 
+In the detail pane, diffs are syntax-highlighted with inline token emphasis (`+`
+added lines in green, `-` removed lines in red, dimmed syntax context, and
+`⋯ N unchanged lines ⋯` banners between separated hunks). Unchanged symbols show
+their complete source in gray, including callees reached from changed callers.
 ## Analysis cache
 
 Processed analyses are cached per revision pair in `calldive/analysis-*.json`

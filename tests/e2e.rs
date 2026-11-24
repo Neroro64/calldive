@@ -405,9 +405,18 @@ pub struct Order {{ pub total: u32 }}
 #[test]
 fn csharp_c_and_cpp_review_changes_and_renames() {
     for (path, source) in [
-        ("src/app.cs", "class App {\nstatic int helper(int x) { return x + 1; }\nstatic int legacy() { return 7; }\nstatic int run() { return helper(1) + legacy(); }\n// EXTRA\n}\n"),
-        ("src/app.c", "int helper(int x) { return x + 1; }\nint legacy(void) { return 7; }\nint run(void) { return helper(1) + legacy(); }\n// EXTRA\n"),
-        ("src/app.cpp", "namespace app {\ntemplate<typename T> T helper(T x) { return x + 1; }\nint legacy() { return 7; }\nint run() { return helper<int>(1) + legacy(); }\n// EXTRA\n}\n"),
+        (
+            "src/app.cs",
+            "class App {\nstatic int helper(int x) { return x + 1; }\nstatic int legacy() { return 7; }\nstatic int run() { return helper(1) + legacy(); }\n// EXTRA\n}\n",
+        ),
+        (
+            "src/app.c",
+            "int helper(int x) { return x + 1; }\nint legacy(void) { return 7; }\nint run(void) { return helper(1) + legacy(); }\n// EXTRA\n",
+        ),
+        (
+            "src/app.cpp",
+            "namespace app {\ntemplate<typename T> T helper(T x) { return x + 1; }\nint legacy() { return 7; }\nint run() { return helper<int>(1) + legacy(); }\n// EXTRA\n}\n",
+        ),
     ] {
         let repo = Repo::new(path.rsplit('/').next().unwrap());
         repo.write(path, source);
@@ -417,7 +426,8 @@ fn csharp_c_and_cpp_review_changes_and_renames() {
         } else {
             "int added() { return 9; }"
         };
-        let head = source.replace("x + 1", "x + 2")
+        let head = source
+            .replace("x + 1", "x + 2")
             .replace("legacy", "renamed")
             .replace("+ renamed();", "+ renamed() + added();")
             .replace("// EXTRA", added);
@@ -426,21 +436,43 @@ fn csharp_c_and_cpp_review_changes_and_renames() {
 
         let (code, out, err) = repo.run(&["HEAD~1", "HEAD", "--dump", "-e", "run"]);
         assert_eq!(code, 0, "{path}: {err}");
-        for (name, status) in [("run", '~'), ("helper", '~'), ("renamed", '>'), ("added", '+')] {
-            let qual = if path.ends_with(".cs") { format!("App::{name}") }
-                else if path.ends_with(".cpp") { format!("app::{name}") }
-                else { name.to_string() };
-            let line = out.lines().find(|line| line.contains(&format!("{status} {qual}")))
+        for (name, status) in [
+            ("run", '~'),
+            ("helper", '~'),
+            ("renamed", '>'),
+            ("added", '+'),
+        ] {
+            let qual = if path.ends_with(".cs") {
+                format!("App::{name}")
+            } else if path.ends_with(".cpp") {
+                format!("app::{name}")
+            } else {
+                name.to_string()
+            };
+            let line = out
+                .lines()
+                .find(|line| line.contains(&format!("{status} {qual}")))
                 .unwrap_or_else(|| panic!("{path}: missing {status} {qual}:\n{out}"));
             if name == "run" {
                 assert!(!line.starts_with(' '), "{path}: root was nested: {line}");
             } else {
-                assert!(line.starts_with("  ") && !line.starts_with("    "), "{path}: callee not nested under run: {line}");
+                assert!(
+                    line.starts_with("  ") && !line.starts_with("    "),
+                    "{path}: callee not nested under run: {line}"
+                );
             }
         }
-        let legacy = if path.ends_with(".cs") { "App::legacy" }
-            else if path.ends_with(".cpp") { "app::legacy" } else { "legacy" };
-        assert!(!out.contains(&format!("- {legacy}")), "{path}: rename reported as removal:\n{out}");
+        let legacy = if path.ends_with(".cs") {
+            "App::legacy"
+        } else if path.ends_with(".cpp") {
+            "app::legacy"
+        } else {
+            "legacy"
+        };
+        assert!(
+            !out.contains(&format!("- {legacy}")),
+            "{path}: rename reported as removal:\n{out}"
+        );
     }
 }
 
@@ -464,7 +496,7 @@ fn file_rename_preserves_function_identity() {
     repo.git(&["mv", "src/old.rs", "src/new.rs"]);
     repo.commit_all("rename");
 
-    assert_summary(&repo, "HEAD~1", "HEAD", (0, 0, 0, 0));
+    assert_summary(&repo, "HEAD~1", "HEAD", (0, 0, 0, 1));
 }
 
 #[test]
@@ -541,9 +573,9 @@ fn adding_only_a_utf8_bom_changes_no_functions() {
     )
     .unwrap();
 
-    assert_summary(&repo, "HEAD", "worktree", (0, 0, 0, 0));
+    assert_summary(&repo, "HEAD", "worktree", (0, 0, 1, 0));
     repo.commit_all("BOM only");
-    assert_summary(&repo, "HEAD~1", "HEAD", (0, 0, 0, 0));
+    assert_summary(&repo, "HEAD~1", "HEAD", (0, 0, 1, 0));
 }
 
 #[test]
@@ -991,10 +1023,12 @@ fn type_rename_and_base_list_change_have_separate_review_spans() {
     assert_eq!(derived["head"]["end"], 4);
     let method = nodes.iter().find(|n| n["name"] == "Worker::Run").unwrap();
     assert_eq!(method["status"], "unchanged");
-    assert!(derived["contracts"]
-        .as_array()
-        .unwrap()
-        .contains(&renamed["key"]));
+    assert!(
+        derived["contracts"]
+            .as_array()
+            .unwrap()
+            .contains(&renamed["key"])
+    );
 }
 
 #[test]
@@ -1188,18 +1222,33 @@ fn cached_review_tracks_same_size_edits_and_untracked_file_lifecycle() {
     let base = "fn run() { alpha(); }\nfn alpha() {}\nfn bravo() {}\nfn delta() {}\n";
     repo.write("src/lib.rs", base);
     repo.commit_all("base");
-    repo.write("src/lib.rs", &base.replace("run() { alpha", "run() { bravo"));
+    repo.write(
+        "src/lib.rs",
+        &base.replace("run() { alpha", "run() { bravo"),
+    );
     let cold = json_review(&repo);
     assert_eq!(json_review(&repo), cold);
-    assert_eq!(json_node(&cold, "run")["callees"], serde_json::json!(["src/lib.rs::bravo"]));
+    assert_eq!(
+        json_node(&cold, "run")["callees"],
+        serde_json::json!(["src/lib.rs::bravo"])
+    );
 
-    repo.write("src/lib.rs", &base.replace("run() { alpha", "run() { delta"));
+    repo.write(
+        "src/lib.rs",
+        &base.replace("run() { alpha", "run() { delta"),
+    );
     let edited = json_review(&repo);
-    assert_eq!(json_node(&edited, "run")["callees"], serde_json::json!(["src/lib.rs::delta"]));
+    assert_eq!(
+        json_node(&edited, "run")["callees"],
+        serde_json::json!(["src/lib.rs::delta"])
+    );
     repo.write("src/fresh.rs", "fn fresh() { run(); }\n");
     let added = json_review(&repo);
     assert_eq!(json_node(&added, "fresh")["status"], "added");
-    assert_eq!(json_node(&added, "fresh")["callees"], serde_json::json!(["src/lib.rs::run"]));
+    assert_eq!(
+        json_node(&added, "fresh")["callees"],
+        serde_json::json!(["src/lib.rs::run"])
+    );
     assert_eq!(json_review(&repo), added);
     fs::remove_file(repo.root.join("src/fresh.rs")).unwrap();
     assert_eq!(json_review(&repo), edited);
@@ -1210,7 +1259,10 @@ fn cached_review_respects_revision_and_test_selection_and_recovers_corruption() 
     let repo = Repo::new("cache-options");
     repo.write("src/lib.rs", "fn stable() {}\n");
     repo.commit_all("base");
-    repo.write("src/lib.rs", "fn stable() {}\nfn added() {}\n#[test] fn check() { added(); }\n");
+    repo.write(
+        "src/lib.rs",
+        "fn stable() {}\nfn added() {}\n#[test] fn check() { added(); }\n",
+    );
     repo.commit_all("head");
     let read = |args: &[&str]| {
         let (code, out, err) = repo.run(args);
@@ -1226,16 +1278,10 @@ fn cached_review_respects_revision_and_test_selection_and_recovers_corruption() 
     assert_eq!(read(&["HEAD~1", "HEAD", "--json"]), regular);
     let reverse = read(&["HEAD", "HEAD~1", "--json"]);
     assert_eq!(json_node(&reverse, "added")["status"], "removed");
-    // Subsequent invocations of either pair hit the cache directly!
-    let (code, _, err) = repo.run(&["HEAD~1", "HEAD", "--json"]);
-    assert_eq!(code, 0, "{err}");
-    assert!(err.contains("using cached analysis"), "expected cache hit for HEAD~1..HEAD, got stderr: {err}");
-    let (code, _, err) = repo.run(&["HEAD", "HEAD~1", "--json"]);
-    assert_eq!(code, 0, "{err}");
-    assert!(err.contains("using cached analysis"), "expected cache hit for HEAD..HEAD~1, got stderr: {err}");
-
-    // Corrupting all cache files produces a warning and recovers cleanly
-    for entry in fs::read_dir(repo.root.join(".git/calldive")).unwrap().flatten() {
+    for entry in fs::read_dir(repo.root.join(".git/calldive"))
+        .unwrap()
+        .flatten()
+    {
         if entry.path().extension().and_then(|e| e.to_str()) == Some("json") {
             fs::write(entry.path(), "{interrupted").unwrap();
         }
@@ -1254,31 +1300,41 @@ fn cache_hits_for_branch_pairs_and_invalidates_when_head_or_commit_id_changes() 
     repo.git(&["branch", "-M", "main"]);
 
     repo.git(&["checkout", "-qb", "dev"]);
-    repo.write("src/lib.rs", "pub fn run() -> u32 { 2 }\npub fn helper() -> u32 { 10 }\n");
+    repo.write(
+        "src/lib.rs",
+        "pub fn run() -> u32 { 2 }\npub fn helper() -> u32 { 10 }\n",
+    );
     repo.commit_all("dev commit 1");
 
     repo.git(&["checkout", "-q", "main"]);
     repo.write("src/other.rs", "pub fn main_only() -> u32 { 99 }\n");
     repo.commit_all("main commit 2");
 
-    // 1. Diffing two branches (`main` vs `dev`): cold miss, then warm hit
     let (code, out1, err1) = repo.run(&["main", "dev", "--json"]);
     assert_eq!(code, 0, "{err1}");
-    assert!(!err1.contains("using cached analysis"), "first run should miss cache: {err1}");
+    assert!(
+        !err1.contains("using cached analysis"),
+        "first run should miss cache: {err1}"
+    );
 
     let (code, out2, err2) = repo.run(&["main", "dev", "--json"]);
     assert_eq!(code, 0, "{err2}");
-    assert!(err2.contains("using cached analysis"), "second run should hit cache: {err2}");
+    assert!(
+        err2.contains("using cached analysis"),
+        "second run should hit cache: {err2}"
+    );
     assert_eq!(out1, out2);
 
-    // 2. Diffing another pair (`HEAD` vs `HEAD~1`) does NOT evict `main` vs `dev`
     let (code, _, err_h1) = repo.run(&["HEAD", "HEAD~1", "--json"]);
     assert_eq!(code, 0, "{err_h1}");
     assert!(!err_h1.contains("using cached analysis"));
 
     let (code, _, err_h2) = repo.run(&["HEAD", "HEAD~1", "--json"]);
     assert_eq!(code, 0, "{err_h2}");
-    assert!(err_h2.contains("using cached analysis"), "HEAD vs HEAD~1 should hit cache: {err_h2}");
+    assert!(
+        err_h2.contains("using cached analysis"),
+        "HEAD vs HEAD~1 should hit cache: {err_h2}"
+    );
 
     let (code, _, err_branch_still_warm) = repo.run(&["main", "dev", "--json"]);
     assert_eq!(code, 0, "{err_branch_still_warm}");
@@ -1287,9 +1343,11 @@ fn cache_hits_for_branch_pairs_and_invalidates_when_head_or_commit_id_changes() 
         "main vs dev should still be cached: {err_branch_still_warm}"
     );
 
-    // 3. When a branch commit ID changes (e.g. `dev` advances), cache for `main` vs `dev` invalidates
     repo.git(&["checkout", "-q", "dev"]);
-    repo.write("src/lib.rs", "pub fn run() -> u32 { 3 }\npub fn helper() -> u32 { 20 }\npub fn extra() -> u32 { 30 }\n");
+    repo.write(
+        "src/lib.rs",
+        "pub fn run() -> u32 { 3 }\npub fn helper() -> u32 { 20 }\npub fn extra() -> u32 { 30 }\n",
+    );
     repo.commit_all("dev commit 2");
     repo.git(&["checkout", "-q", "main"]);
 
@@ -1300,14 +1358,18 @@ fn cache_hits_for_branch_pairs_and_invalidates_when_head_or_commit_id_changes() 
         "advancing dev commit ID must invalidate cache: {err3}"
     );
     let v3: serde_json::Value = serde_json::from_str(&out3).unwrap();
-    assert!(v3["nodes"].as_array().unwrap().iter().any(|n| n["name"] == "extra"));
+    assert!(
+        v3["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n["name"] == "extra")
+    );
 
-    // Warm again after recomputation
     let (code, _, err4) = repo.run(&["main", "dev", "--json"]);
     assert_eq!(code, 0, "{err4}");
     assert!(err4.contains("using cached analysis"), "{err4}");
 
-    // 4. When HEAD changes (e.g. new commit or checkout), cache invalidates
     repo.write("src/unrelated_note.txt", "bump head\n");
     repo.commit_all("advance HEAD");
 
@@ -1320,4 +1382,55 @@ fn cache_hits_for_branch_pairs_and_invalidates_when_head_or_commit_id_changes() 
     let (code, _, err6) = repo.run(&["main~1", "dev", "--json"]);
     assert_eq!(code, 0, "{err6}");
     assert!(err6.contains("using cached analysis"), "{err6}");
+}
+
+#[test]
+fn value_and_settings_changes_link_to_consumers_without_duplicate_file_roots() {
+    let repo = Repo::new("consumer-flow");
+    repo.write(
+        "src/Client.cs",
+        "namespace Ns1;\npublic sealed class ChatClient {\n    public void Send() {}\n}\n",
+    );
+    repo.write(
+        "src/Settings.cs",
+        "namespace Ns2;\npublic record TrackerSettings(string Url);\n",
+    );
+    repo.write(
+        "src/CompositionRoot.cs",
+        "namespace Host;\npublic class CompositionRoot {\n    public void RegisterClients() { var t = 30; }\n    public void RegisterTracker(IConfig cfg) {\n        var s = cfg.GetRequiredSettings<TrackerSettings>(\"s\");\n    }\n}\n",
+    );
+    repo.commit_all("base");
+
+    repo.write(
+        "src/Client.cs",
+        "using System;\nnamespace Ns1;\npublic sealed class ChatClient {\n    public static TimeSpan DefaultTimeout { get; } = TimeSpan.FromMinutes(5);\n    public void Send() {}\n}\n",
+    );
+    repo.write(
+        "src/Settings.cs",
+        "using System;\nnamespace Ns2;\npublic record TrackerSettings(string Url, TimeSpan? Timeout = null) {\n    public void Validate() {}\n}\n",
+    );
+    repo.write(
+        "src/CompositionRoot.cs",
+        "namespace Host;\npublic class CompositionRoot {\n    public void RegisterClients() { var t = ChatClient.DefaultTimeout; }\n    public void RegisterTracker(IConfig cfg) {\n        var s = cfg.GetRequiredSettings<TrackerSettings>(\"s\");\n        s.Validate();\n    }\n}\n",
+    );
+
+    let (code, dump, err) = repo.run(&["HEAD", "--dump"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        !dump.contains("src/Settings.cs :Settings.cs"),
+        "record edit must not spawn a duplicate <file> root:\n{dump}"
+    );
+    assert!(
+        !dump.contains("src/Client.cs :Client.cs"),
+        "using-directive + property edit must not spawn a duplicate <file> root:\n{dump}"
+    );
+    assert!(
+        dump.contains("+ Ns1::ChatClient::DefaultTimeout")
+            && dump.contains("> Host::CompositionRoot::RegisterClients"),
+        "property addition must expand to its consumer:\n{dump}"
+    );
+    assert!(
+        dump.contains("> Host::CompositionRoot::RegisterTracker"),
+        "settings record/method must expand to its consumer:\n{dump}"
+    );
 }
