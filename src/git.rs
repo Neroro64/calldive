@@ -114,7 +114,7 @@ impl GitRepo {
             "rev-parse",
             "--path-format=absolute",
             "--git-path",
-            "calldive",
+            "logidiff",
         ])?;
         let path = String::from_utf8(out).context("git returned a non-UTF-8 cache path")?;
         Ok(PathBuf::from(path.trim_end_matches(['\r', '\n'])))

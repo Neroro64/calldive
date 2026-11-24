@@ -1,10 +1,10 @@
-# calldive
+# logidiff
 
 Interactive TUI code review for the agentic era. Built with Rust + ratatui.
 
 AI agents produce large diffs fast. A flat, file-by-file line diff buries the
 one thing a senior reviewer actually needs: **what behavior changed and how it
-flows**. calldive reviews a change the way it executes:
+flows**. logidiff reviews a change the way it executes:
 
 1. Parse the changed files of a git range with tree-sitter (Rust, Python,
    TypeScript/TSX, JavaScript/JSX, Go, C#, C, C++). In worktree mode, untracked
@@ -22,7 +22,7 @@ flows**. calldive reviews a change the way it executes:
 
 Renames with edits retain their original name and base span when matching evidence
 is strong, but use `~` so the edit is not hidden. Ambiguous matches remain added
-and removed rather than inventing a rename. calldive reviews changes; it does
+and removed rather than inventing a rename. logidiff reviews changes; it does
 not perform rename refactorings or rewrite implementations.
 
 Unchanged callers and explicit implementations affected by a contract change
@@ -32,27 +32,27 @@ remain relevant. `f` hides branches that are not relevant.
 
 ```bash
 # open the interactive source/target revision selector TUI
-calldive
+logidiff
 # specify source and target revisions directly
-calldive HEAD~1 HEAD
-calldive HEAD origin/main
-calldive main feature/my-branch
+logidiff HEAD~1 HEAD
+logidiff HEAD origin/main
+logidiff main feature/my-branch
 # review the working tree (including non-ignored untracked files) against HEAD
-calldive HEAD
-calldive HEAD --entry process_refund
-calldive HEAD --entry 'Worker::run'
+logidiff HEAD
+logidiff HEAD --entry process_refund
+logidiff HEAD --entry 'Worker::run'
 # start at an interface/base type or a contract declaration
-calldive HEAD --entry 'IWorker'
-calldive HEAD --entry 'IWorker::Run'
-calldive HEAD --entry 'src/x.rs::run'
-calldive HEAD --entry 'x.rs::run'
-calldive HEAD --dump
-calldive HEAD --json
+logidiff HEAD --entry 'IWorker'
+logidiff HEAD --entry 'IWorker::Run'
+logidiff HEAD --entry 'src/x.rs::run'
+logidiff HEAD --entry 'x.rs::run'
+logidiff HEAD --dump
+logidiff HEAD --json
 # include clean root components / test symbols
-calldive --all
-calldive --tests
+logidiff --all
+logidiff --tests
 # initially hide branches that do not reach a change (TUI only)
-calldive --focus
+logidiff --focus
 ```
 
 An exact `--entry` node key wins. Otherwise a simple or qualified name, or a
@@ -81,7 +81,7 @@ relationship; they are not claims that the head revision compiles or that these
 are executed calls. `callees` remains separate. The TUI labels these dependency
 edges `(base/head)` and the review tree follows them alongside call edges.
 
-Selector keys (when launched with `calldive`): `j/k` move · `tab`/`h`/`l` switch source/target pane · `enter` diff selected pair · `s` swap source and target · `/` filter list · `i` enter custom revision · `q`/`esc` quit.
+Selector keys (when launched with `logidiff`): `j/k` move · `tab`/`h`/`l` switch source/target pane · `enter` diff selected pair · `s` swap source and target · `/` filter list · `i` enter custom revision · `q`/`esc` quit.
 
 Review keys: `j/k` move · `Ctrl+D`/`Ctrl+U` half-page scroll (in both Call Tree
 and Symbol Diff) · `enter`/`space`/`l` toggle expansion in tree · `h` collapse
@@ -98,7 +98,7 @@ added lines in green, `-` removed lines in red, dimmed syntax context, and
 their complete source in gray, including callees reached from changed callers.
 ## Analysis cache
 
-Processed analyses are cached per revision pair in `calldive/analysis-*.json`
+Processed analyses are cached per revision pair in `logidiff/analysis-*.json`
 under the repository's Git directory (each linked worktree has its own cache,
 retaining up to 16 recent entries). Rerunning the same review prints
 `using cached analysis` to stderr and skips source gathering, parsing, and graph
@@ -113,7 +113,7 @@ as `--entry`, `--all`, `--focus`, `--dump`, and `--json` reuse it. Revision
 source text is retained so cached reviews still show added/removed symbol
 content. Corrupt or unwritable caches produce a warning and do not prevent
 review. To clear the cache, remove the files in the directory reported by
-`git rev-parse --path-format=absolute --git-path calldive`.
+`git rev-parse --path-format=absolute --git-path logidiff`.
 
 ## How it works
 
@@ -212,5 +212,5 @@ review. To clear the cache, remove the files in the directory reported by
 [hopdiff](https://github.com/tautology-labs/hopdiff) (call-graph diff, static
 output, TS only),
 [calldiff](https://github.com/tanishqkancharla/calldiff) (call-stack diff,
-static output). calldive's niche: an *interactive* review session — DFS from
+static output). logidiff's niche: an *interactive* review session — DFS from
 entry points with a diff at every hop, in the terminal.

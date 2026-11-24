@@ -994,7 +994,7 @@ pub fn draw(f: &mut ratatui::Frame, app: &mut App) {
     let (ad, rm, ch, mv) = app.a.summary;
     let header = Line::from(vec![
         Span::styled(
-            " calldive ",
+            " logidiff ",
             Style::default().bg(Color::Blue).fg(Color::White),
         ),
         Span::raw("  "),
@@ -1242,7 +1242,7 @@ pub fn build_help_lines(include_annotations: bool) -> Vec<Line<'static>> {
         Line::from(""),
         heading("Overview"),
         Line::from(Span::styled(
-            "    calldive parses both revisions with tree-sitter and organizes diffs into a",
+            "    logidiff parses both revisions with tree-sitter and organizes diffs into a",
             Style::default().fg(Color::Gray),
         )),
         Line::from(Span::styled(
@@ -1429,7 +1429,7 @@ fn draw_help_modal(f: &mut ratatui::Frame, app: &mut App) {
     f.render_widget(Clear, rect);
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" calldive help & color legend (j/k/Ctrl+D/U scroll · ?/Esc close) ")
+        .title(" logidiff help & color legend (j/k/Ctrl+D/U scroll · ?/Esc close) ")
         .border_style(Style::default().fg(Color::Blue))
         .style(Style::default().bg(app.palette.background));
     let inner = block.inner(rect);
@@ -1878,7 +1878,7 @@ pub fn draw_selector(f: &mut ratatui::Frame, sel: &mut Selector) {
     let tgt_label = sel.selected_target().unwrap_or("—");
     let header = Line::from(vec![
         Span::styled(
-            " calldive ",
+            " logidiff ",
             Style::default().bg(Color::Blue).fg(Color::White),
         ),
         Span::raw("  select revisions to diff: "),

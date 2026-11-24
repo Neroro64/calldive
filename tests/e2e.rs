@@ -20,7 +20,7 @@ impl Repo {
     fn new(name: &str) -> Self {
         let n = REPO_SEQ.fetch_add(1, Ordering::SeqCst);
         let root =
-            std::env::temp_dir().join(format!("calldive-e2e-{}-{}-{n}", std::process::id(), name));
+            std::env::temp_dir().join(format!("logidiff-e2e-{}-{}-{n}", std::process::id(), name));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("src")).unwrap();
         let r = Self { root, keep: false };
@@ -56,12 +56,12 @@ impl Repo {
     }
 
     fn run(&self, args: &[&str]) -> (i32, String, String) {
-        let out = Command::new(env!("CARGO_BIN_EXE_calldive"))
+        let out = Command::new(env!("CARGO_BIN_EXE_logidiff"))
             .arg("--repo")
             .arg(&self.root)
             .args(args)
             .output()
-            .expect("calldive spawn");
+            .expect("logidiff spawn");
         (
             out.status.code().unwrap_or(-1),
             String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -1278,7 +1278,7 @@ fn cached_review_respects_revision_and_test_selection_and_recovers_corruption() 
     assert_eq!(read(&["HEAD~1", "HEAD", "--json"]), regular);
     let reverse = read(&["HEAD", "HEAD~1", "--json"]);
     assert_eq!(json_node(&reverse, "added")["status"], "removed");
-    for entry in fs::read_dir(repo.root.join(".git/calldive"))
+    for entry in fs::read_dir(repo.root.join(".git/logidiff"))
         .unwrap()
         .flatten()
     {

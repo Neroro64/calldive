@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 
 // Changing the executable also invalidates entries, including local rebuilds.
-const FORMAT: &[u8] = b"calldive-analysis-v4";
+const FORMAT: &[u8] = b"logidiff-analysis-v4";
 const MAX_ENTRIES: usize = 16;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -187,8 +187,8 @@ fn executable_digest() -> Result<&'static [u8; 32]> {
     if let Some(digest) = DIGEST.get() {
         return Ok(digest);
     }
-    let executable = std::env::current_exe().context("locating calldive executable")?;
-    let mut binary = File::open(executable).context("reading calldive executable")?;
+    let executable = std::env::current_exe().context("locating logidiff executable")?;
+    let mut binary = File::open(executable).context("reading logidiff executable")?;
     let mut executable_hash = blake3::Hasher::new();
     executable_hash.update_reader(&mut binary)?;
     let digest = *executable_hash.finalize().as_bytes();

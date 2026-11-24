@@ -218,35 +218,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "64fa3c856b712db6612c019f14756e64e4bcea13337a6b33b696333a9eaa2d06"
 
 [[package]]
-name = "calldive"
-version = "0.2.0"
-dependencies = [
- "aho-corasick",
- "anyhow",
- "blake3",
- "clap",
- "ratatui",
- "serde",
- "serde_json",
- "similar",
- "syntect",
- "tempfile",
- "test-case",
- "tree-sitter",
- "tree-sitter-c",
- "tree-sitter-c-sharp",
- "tree-sitter-cpp",
- "tree-sitter-go",
- "tree-sitter-javascript",
- "tree-sitter-python",
- "tree-sitter-rust",
- "tree-sitter-typescript",
- "two-face",
- "unicode-segmentation",
- "unicode-width",
-]
-
-[[package]]
 name = "castaway"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -855,6 +826,35 @@ name = "log"
 version = "0.4.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
+
+[[package]]
+name = "logidiff"
+version = "0.3.0"
+dependencies = [
+ "aho-corasick",
+ "anyhow",
+ "blake3",
+ "clap",
+ "ratatui",
+ "serde",
+ "serde_json",
+ "similar",
+ "syntect",
+ "tempfile",
+ "test-case",
+ "tree-sitter",
+ "tree-sitter-c",
+ "tree-sitter-c-sharp",
+ "tree-sitter-cpp",
+ "tree-sitter-go",
+ "tree-sitter-javascript",
+ "tree-sitter-python",
+ "tree-sitter-rust",
+ "tree-sitter-typescript",
+ "two-face",
+ "unicode-segmentation",
+ "unicode-width",
+]
 
 [[package]]
 name = "lru"

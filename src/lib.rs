@@ -164,7 +164,7 @@ mod tests {
         git(directory.path(), &["config", "user.name", "Calldive Tests"]);
         git(
             directory.path(),
-            &["config", "user.email", "calldive@example.invalid"],
+            &["config", "user.email", "logidiff@example.invalid"],
         );
         directory
     }
