@@ -246,12 +246,20 @@ fn main() -> Result<()> {
                 ""
             };
             let consumer_prefix = if r.is_consumer { "> " } else { "" };
+            let shared_note = if r.shared_callers.len() >= 2 {
+                format!(" [← {}]", r.shared_callers.join(", "))
+            } else if r.is_repeat {
+                " [↗]".to_string()
+            } else {
+                String::new()
+            };
             println!(
-                "{}{} {}{} :{}  {}-{}{}",
+                "{}{} {}{}{} :{}  {}-{}{}",
                 indent,
                 n.status.glyph(),
                 consumer_prefix,
                 n.name,
+                shared_note,
                 a.label(&n.file),
                 span.start_row + 1,
                 span.end_row,

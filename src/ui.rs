@@ -1,6 +1,6 @@
 //! ratatui UI: entry-point tree (left), per-symbol diff (right).
 
-use crate::analysis::{self, Analysis, EntryRole, Status, TreeRow};
+use crate::analysis::{self, Analysis, CallerBracket, EntryRole, Status, TreeRow};
 use crate::diffview::{DiffItem, Sign, fn_diff_items};
 use crate::git::{BINARY_SOURCE_PREFIX, RevCandidate};
 use crate::highlight::{
@@ -101,17 +101,14 @@ impl App {
             detail_cache: HashMap::new(),
         };
         warmup_paths(app.a.nodes.values().map(|n| n.file.as_str()));
-        let roots = app.roots.clone();
-        for r in &roots {
-            if app.a.nodes.get(r).map(|n| n.relevant).unwrap_or(false) {
-                app.expanded.insert(r.clone());
-            }
-        }
-        app.expand_all_group_headers();
+        app.reset_default_expansion();
         app.rebuild();
-        if let Some(row) = app.rows.get(app.sel)
-            && row.group_label.is_none()
-            && row.display_name.is_none()
+        let any_grouped = app
+            .rows
+            .iter()
+            .any(|r| r.group_label.is_some() || r.display_name.is_some());
+        if !any_grouped
+            && let Some(row) = app.rows.get(app.sel)
             && let Some(node) = app.a.nodes.get(&row.key)
         {
             let name = &node.name;
@@ -124,13 +121,17 @@ impl App {
         app
     }
 
-    fn expand_all_group_headers(&mut self) {
+    fn reset_default_expansion(&mut self) {
+        self.expanded.clear();
         loop {
             let rows =
                 analysis::build_grouped_rows(&self.a, &self.roots, &self.expanded, self.focus_mode);
             let mut added = false;
             for r in rows {
-                if r.group_label.is_some() && self.expanded.insert(r.key) {
+                let expand_root = r.is_root
+                    && r.has_children
+                    && self.a.nodes.get(&r.key).is_some_and(|n| n.relevant);
+                if (r.group_label.is_some() || expand_root) && self.expanded.insert(r.expand_key) {
                     added = true;
                 }
             }
@@ -153,10 +154,35 @@ impl App {
     }
 
     pub fn rebuild(&mut self) {
+        self.rebuild_preserving(None);
+    }
+
+    fn rebuild_preserving(&mut self, target_id: Option<&str>) {
+        let wanted_id = target_id
+            .map(str::to_string)
+            .or_else(|| self.rows.get(self.sel).map(|r| r.id.clone()));
+        let wanted_key = self.rows.get(self.sel).map(|r| r.key.clone());
         let roots = self.roots.clone();
         self.rows = analysis::build_grouped_rows(&self.a, &roots, &self.expanded, self.focus_mode);
-        if self.sel >= self.rows.len() {
-            self.sel = self.rows.len().saturating_sub(1);
+        if self.rows.is_empty() {
+            self.sel = 0;
+        } else if let Some(ref id) = wanted_id {
+            if let Some(pos) = self.rows.iter().position(|r| r.id == *id) {
+                self.sel = pos;
+            } else if let Some(pos) = self.rows.iter().rposition(|r| {
+                id.starts_with(&format!("{}/", r.id))
+                    || id.starts_with(&format!("{}/", r.expand_key))
+            }) {
+                self.sel = pos;
+            } else if let Some(ref key) = wanted_key
+                && let Some(pos) = self.rows.iter().position(|r| &r.key == key)
+            {
+                self.sel = pos;
+            } else if self.sel >= self.rows.len() {
+                self.sel = self.rows.len() - 1;
+            }
+        } else if self.sel >= self.rows.len() {
+            self.sel = self.rows.len() - 1;
         }
         self.update_detail();
     }
@@ -629,22 +655,17 @@ impl App {
     }
 
     fn toggle_expand(&mut self) {
-        let Some(k) = self.selected_key().cloned() else {
+        let Some(row) = self.rows.get(self.sel) else {
             return;
         };
-        let has_children = self
-            .rows
-            .get(self.sel)
-            .map(|r| r.has_children)
-            .unwrap_or(false);
-        if has_children {
-            if self.expanded.contains(&k) {
-                self.expanded.remove(&k);
-            } else {
-                self.expanded.insert(k);
-            }
-            self.rebuild();
+        if !row.has_children {
+            return;
         }
+        let ek = row.expand_key.clone();
+        if !self.expanded.remove(&ek) {
+            self.expanded.insert(ek);
+        }
+        self.rebuild();
     }
 
     fn toggle_gap_at_cursor(&mut self) -> bool {
@@ -902,19 +923,27 @@ impl App {
                 let Some(r) = self.rows.get(self.sel) else {
                     return;
                 };
-                let k = r.key.clone();
-                if self.expanded.contains(&k) {
-                    self.expanded.remove(&k);
+                let ek = r.expand_key.clone();
+                if r.has_children && self.expanded.contains(&ek) {
+                    self.expanded.remove(&ek);
+                    self.rebuild();
                 } else if r.depth > 0 {
-                    // collapse the nearest expanded ancestor above
+                    // collapse the nearest expanded ancestor above and focus that ancestor
+                    let mut target_anc: Option<(String, String)> = None;
                     for row in self.rows[..self.sel].iter().rev() {
-                        if row.depth < r.depth && self.expanded.contains(&row.key) {
-                            self.expanded.remove(&row.key);
+                        if row.depth < r.depth
+                            && row.has_children
+                            && self.expanded.contains(&row.expand_key)
+                        {
+                            target_anc = Some((row.id.clone(), row.expand_key.clone()));
                             break;
                         }
                     }
+                    if let Some((anc_id, anc_ek)) = target_anc {
+                        self.expanded.remove(&anc_ek);
+                        self.rebuild_preserving(Some(&anc_id));
+                    }
                 }
-                self.rebuild();
             }
             KeyCode::Tab => {
                 self.detail_selection = None;
@@ -933,21 +962,53 @@ impl App {
                 });
             }
             KeyCode::Char('e') => {
-                self.expanded.clear();
-                let roots = self.roots.clone();
-                for r in &roots {
-                    if self.a.nodes.get(r).map(|n| n.relevant).unwrap_or(false) {
-                        self.expanded.insert(r.clone());
-                    }
-                }
-                self.expand_all_group_headers();
+                self.reset_default_expansion();
                 self.rebuild();
                 self.flash = Some("collapsed to roots".into());
             }
             KeyCode::Char('x') => {
-                if let Some(k) = self.selected_key().cloned() {
-                    expand_all(&self.a, &k, &mut self.expanded, 5);
-                    self.rebuild();
+                if let Some(base) = self.rows.get(self.sel) {
+                    let root_id = base.id.clone();
+                    let base_depth = base.depth;
+                    let max_levels = 5usize;
+                    for _ in 0..max_levels {
+                        let rows = analysis::build_grouped_rows(
+                            &self.a,
+                            &self.roots,
+                            &self.expanded,
+                            self.focus_mode,
+                        );
+                        let Some(start_idx) = rows.iter().position(|r| r.id == root_id) else {
+                            break;
+                        };
+                        let mut added = false;
+                        let start_ek = rows[start_idx].expand_key.clone();
+                        let start_coupled = rows[start_idx].caller_bracket.is_some();
+                        if rows[start_idx].has_children && self.expanded.insert(start_ek.clone()) {
+                            added = true;
+                        }
+                        for row in &rows[start_idx + 1..] {
+                            if row.depth == base_depth {
+                                if start_coupled && row.expand_key == start_ek {
+                                    continue;
+                                }
+                                break;
+                            }
+                            if row.depth < base_depth {
+                                break;
+                            }
+                            if row.depth < base_depth + max_levels
+                                && row.has_children
+                                && self.expanded.insert(row.expand_key.clone())
+                            {
+                                added = true;
+                            }
+                        }
+                        if !added {
+                            break;
+                        }
+                    }
+                    self.rebuild_preserving(Some(&root_id));
                     self.flash = Some("expanded subtree".into());
                 }
             }
@@ -961,13 +1022,23 @@ impl App {
     }
 }
 
-fn expand_all(a: &Analysis, key: &str, expanded: &mut HashSet<String>, depth: usize) {
-    if depth == 0 {
-        return;
-    }
-    expanded.insert(key.to_string());
-    for child in analysis::children_of(a, key, false) {
-        expand_all(a, &child, expanded, depth - 1);
+fn format_shared_callers_badge(callers: &[String], from_coupled: bool) -> String {
+    let joined = callers.join(", ");
+    if from_coupled && joined.width() > 32 {
+        if callers.len() == 2 {
+            "[← both above]".to_string()
+        } else {
+            format!("[← {} above]", callers.len())
+        }
+    } else if callers.len() <= 2 {
+        format!("[← {joined}]")
+    } else {
+        format!(
+            "[← {}, {} +{}]",
+            callers[0],
+            callers[1],
+            callers.len() - 2
+        )
     }
 }
 
@@ -1027,7 +1098,7 @@ pub fn draw(f: &mut ratatui::Frame, app: &mut App) {
             let sel = i == app.sel && app.focus == Focus::Tree;
             let indent = "  ".repeat(r.depth);
             let expand_glyph = if r.has_children {
-                if app.expanded.contains(&r.key) {
+                if app.expanded.contains(&r.expand_key) {
                     "▾ "
                 } else {
                     "▸ "
@@ -1048,7 +1119,9 @@ pub fn draw(f: &mut ratatui::Frame, app: &mut App) {
                 ]
             } else {
                 let n = &app.a.nodes[&r.key];
-                let name_style = if n.status.is_change() {
+                let name_style = if r.is_repeat {
+                    Style::default().fg(status_color(n.status))
+                } else if n.status.is_change() {
                     Style::default()
                         .fg(status_color(n.status))
                         .add_modifier(Modifier::BOLD)
@@ -1063,15 +1136,23 @@ pub fn draw(f: &mut ratatui::Frame, app: &mut App) {
                     .unwrap_or(n.name.as_str())
                     .to_string();
                 let role = app.a.classify_node(n);
-                let show_role = n.status.is_change() && (r.depth == 0 || r.display_name.is_some());
-                let mut row_spans = vec![
-                    Span::raw(indent),
-                    Span::raw(expand_glyph),
-                    Span::styled(
-                        n.status.glyph().to_string() + " ",
-                        Style::default().fg(status_color(n.status)),
-                    ),
-                ];
+                let show_role = n.status.is_change() && r.is_root && !r.is_repeat;
+                let mut row_spans = vec![Span::raw(indent)];
+                if let Some(bracket) = r.caller_bracket {
+                    let b_ch = match bracket {
+                        CallerBracket::First => "┌",
+                        CallerBracket::Middle => "├",
+                        CallerBracket::Last => "└",
+                    };
+                    row_spans.push(Span::styled(b_ch, Style::default().fg(Color::Cyan)));
+                    row_spans.push(Span::styled(expand_glyph, Style::default().fg(Color::Cyan)));
+                } else {
+                    row_spans.push(Span::raw(expand_glyph));
+                }
+                row_spans.push(Span::styled(
+                    n.status.glyph().to_string() + " ",
+                    Style::default().fg(status_color(n.status)),
+                ));
                 if r.is_consumer {
                     row_spans.push(Span::styled(
                         "> ",
@@ -1081,6 +1162,27 @@ pub fn draw(f: &mut ratatui::Frame, app: &mut App) {
                     ));
                 }
                 row_spans.push(Span::styled(shown_name, name_style));
+                if r.shared_callers.len() >= 2 {
+                    row_spans.push(Span::styled(
+                        format!(
+                            "  {}",
+                            format_shared_callers_badge(&r.shared_callers, r.shared_from_coupled)
+                        ),
+                        Style::default().fg(Color::Cyan),
+                    ));
+                }
+                if r.is_repeat {
+                    row_spans.push(Span::styled(
+                        "  [↗ above]",
+                        Style::default().fg(Color::Cyan),
+                    ));
+                }
+                if let Some(hint) = &r.collapsed_callee_hint {
+                    row_spans.push(Span::styled(
+                        format!("  {hint}"),
+                        Style::default().fg(Color::Cyan),
+                    ));
+                }
                 if show_role {
                     row_spans.push(Span::styled(
                         format!("  [{}]", role.label()),
@@ -1300,6 +1402,18 @@ pub fn build_help_lines(include_annotations: bool) -> Vec<Line<'static>> {
             Style::default().fg(Color::Blue),
             "Blue",
             "Shared namespace/module/class container header, or active focused pane border",
+        ),
+        swatch_row(
+            "┌/└  Shared",
+            Style::default().fg(Color::Cyan),
+            "Cyan bracket",
+            "Sibling callers sharing the same downstream callee(s), rendered once below ([← ...])",
+        ),
+        swatch_row(
+            "[↗ above]",
+            Style::default().fg(Color::Cyan),
+            "Cyan ref",
+            "Callee whose subtree was already rendered in an earlier branch",
         ),
         swatch_row(
             "external",
@@ -2770,6 +2884,298 @@ mod tests {
         assert!(
             elapsed.as_millis() < 250,
             "moving across C# subtrees should stay responsive (<250ms for 3 full passes), took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn csharp_materializer_diamond_deduplicates_type_members_and_shared_callees() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mat_base = r#"namespace EA.TriageEngine.Core.AI.RootCauseAnalysis.RootCauseHypothesisWorkflow.Executors;
+public sealed class RootCauseHypothesisMaterializer(ILogger logger) {
+    public void MaterializeAsync() {
+        CreateBuildInfrastructureAsync();
+        CreatePreflightIssueAsync();
+    }
+    private int CreateBuildInfrastructureAsync() {
+        return 1;
+    }
+    private int CreatePreflightIssueAsync() {
+        return 2;
+    }
+}
+"#;
+        let mat_head = r#"namespace EA.TriageEngine.Core.AI.RootCauseAnalysis.RootCauseHypothesisWorkflow.Executors;
+public sealed class RootCauseHypothesisMaterializer(ILogger logger, IssueOwnershipSettings settings) {
+    public void MaterializeAsync() {
+        CreateBuildInfrastructureAsync();
+        CreatePreflightIssueAsync();
+    }
+    private int CreateBuildInfrastructureAsync() {
+        return ResolveBuildInfrastructureOwnership() + 1;
+    }
+    private int CreatePreflightIssueAsync() {
+        return ResolveBuildInfrastructureOwnership() + 2;
+    }
+    private int ResolveBuildInfrastructureOwnership() {
+        return settings.GetBuildInfrastructureOwner();
+    }
+}
+"#;
+        let own_base = r#"namespace EA.TriageEngine.Core.System.FailureBucketSolver.Ownership;
+public sealed class IssueOwnershipSettings(string defaultOwner) {
+}
+"#;
+        let own_head = r#"namespace EA.TriageEngine.Core.System.FailureBucketSolver.Ownership;
+public sealed class IssueOwnershipSettings(string defaultOwner, string infraOwner) {
+    public int GetBuildInfrastructureOwner() {
+        return 42;
+    }
+}
+"#;
+
+        let a = analysis::analyze(&analysis::Inputs {
+            files: vec![
+                (
+                    "RootCauseHypothesisMaterializer.cs".into(),
+                    Some(mat_base.into()),
+                    Some(mat_head.into()),
+                ),
+                (
+                    "IssueOwnershipSettings.cs".into(),
+                    Some(own_base.into()),
+                    Some(own_head.into()),
+                ),
+            ],
+            extra_head: vec![],
+            include_tests: false,
+        });
+        let roots: Vec<String> = a
+            .entry_points
+            .iter()
+            .filter(|k| a.nodes.get(*k).is_some_and(|n| n.relevant))
+            .cloned()
+            .collect();
+        let mut app = App::new(a, roots, true);
+
+        // Before expanding the coupled callers, verify bracket + collapsed preview hint
+        let create_build_idx = app
+            .rows
+            .iter()
+            .position(|r| r.key.ends_with("::CreateBuildInfrastructureAsync"))
+            .expect("CreateBuildInfrastructureAsync present");
+        let create_preflight_idx = app
+            .rows
+            .iter()
+            .position(|r| r.key.ends_with("::CreatePreflightIssueAsync"))
+            .expect("CreatePreflightIssueAsync present");
+        assert_eq!(
+            app.rows[create_build_idx].caller_bracket,
+            Some(CallerBracket::First)
+        );
+        assert_eq!(
+            app.rows[create_preflight_idx].caller_bracket,
+            Some(CallerBracket::Last)
+        );
+        assert_eq!(
+            app.rows[create_preflight_idx]
+                .collapsed_callee_hint
+                .as_deref(),
+            Some("→ + ResolveBuildInfrastructureOwnership")
+        );
+
+        // Move cursor to CreatePreflightIssueAsync and press Enter: cursor must stay on it!
+        app.sel = create_preflight_idx;
+        app.update_detail();
+        let selected_before = app.rows[app.sel].key.clone();
+        app.handle_key(KeyCode::Enter);
+        assert_eq!(app.rows[app.sel].key, selected_before);
+
+        // Expand ResolveBuildInfrastructureOwnership directly below
+        let resolve_idx = app
+            .rows
+            .iter()
+            .position(|r| r.key.ends_with("::ResolveBuildInfrastructureOwnership"))
+            .expect("ResolveBuildInfrastructureOwnership expanded");
+        assert_eq!(resolve_idx, app.sel + 1);
+        assert_eq!(
+            app.rows[resolve_idx].shared_callers,
+            vec![
+                "CreateBuildInfrastructureAsync".to_string(),
+                "CreatePreflightIssueAsync".to_string()
+            ]
+        );
+        app.sel = resolve_idx;
+        app.update_detail();
+        app.handle_key(KeyCode::Enter);
+        assert_eq!(
+            app.rows[app.sel].key,
+            app.rows[resolve_idx].key,
+            "cursor must remain on ResolveBuildInfrastructureOwnership"
+        );
+
+        // GetBuildInfrastructureOwner must be a leaf (no bogus consumer back-edge cycle)
+        let owner_fn_idx = app
+            .rows
+            .iter()
+            .position(|r| r.key.ends_with("::GetBuildInfrastructureOwner"))
+            .expect("GetBuildInfrastructureOwner visible");
+        assert!(
+            !app.rows[owner_fn_idx].has_children,
+            "leaf callee must not have a cyclic consumer back-edge"
+        );
+
+        // Every symbol key in the entire expanded tree must appear ONCE (zero duplicates!)
+        let symbol_keys: Vec<&str> = app
+            .rows
+            .iter()
+            .filter(|r| r.group_label.is_none())
+            .map(|r| r.key.as_str())
+            .collect();
+        let unique_keys: HashSet<&str> = symbol_keys.iter().copied().collect();
+        assert_eq!(
+            symbol_keys.len(),
+            unique_keys.len(),
+            "duplicate symbol entries found in tree: {symbol_keys:#?}"
+        );
+
+        // Render and verify bracket + badge visuals
+        let mut terminal = Terminal::new(TestBackend::new(160, 24)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(rendered.contains("┌▾"));
+        assert!(rendered.contains("└▾"));
+        assert!(rendered.contains("[← both above]"));
+    }
+
+    #[test]
+    fn partial_overlap_sibling_callers_render_shared_callee_once_and_preserve_cursor() {
+        let base = r#"
+fn entry() { sym_a(); sym_b(); }
+fn sym_a() { old_a(); }
+fn sym_b() { old_b(); }
+"#;
+        let head = r#"
+fn entry() { sym_a(); sym_b(); }
+fn sym_a() { unique_x(); shared_c(); }
+fn sym_b() { unique_y(); shared_c(); }
+fn unique_x() {}
+fn unique_y() {}
+fn shared_c() { leaf_d(); }
+fn leaf_d() {}
+"#;
+        let a = analyze(base, head);
+        let entry_key = analysis::node_key("src/lib.rs", "entry");
+        let mut app = App::new(a, vec![entry_key], true);
+
+        // Expand sym_a -> reveals unique_x and shared_c [← sym_a, sym_b]
+        let a_idx = app
+            .rows
+            .iter()
+            .position(|r| r.key.ends_with("::sym_a"))
+            .unwrap();
+        app.sel = a_idx;
+        app.handle_key(KeyCode::Enter);
+        assert!(app.rows[app.sel].key.ends_with("::sym_a"));
+
+        // Expand shared_c -> reveals leaf_d
+        let c_idx = app
+            .rows
+            .iter()
+            .position(|r| r.key.ends_with("::shared_c"))
+            .unwrap();
+        assert_eq!(app.rows[c_idx].shared_callers, vec!["sym_a", "sym_b"]);
+        app.sel = c_idx;
+        app.handle_key(KeyCode::Enter);
+        assert!(app.rows.iter().any(|r| r.key.ends_with("::leaf_d")));
+
+        // Now move cursor to sym_b (below shared_c/leaf_d) and press Enter:
+        // cursor MUST stay on sym_b, shared_c MUST stay expanded (leaf_d visible),
+        // and neither shared_c nor leaf_d may be duplicated!
+        let b_idx = app
+            .rows
+            .iter()
+            .position(|r| r.key.ends_with("::sym_b"))
+            .unwrap();
+        app.sel = b_idx;
+        app.handle_key(KeyCode::Enter);
+        assert!(
+            app.rows[app.sel].key.ends_with("::sym_b"),
+            "cursor jumped away from sym_b onto {}",
+            app.rows[app.sel].key
+        );
+        assert!(app.rows.iter().any(|r| r.key.ends_with("::unique_y")));
+        assert!(app.rows.iter().any(|r| r.key.ends_with("::leaf_d")));
+
+        let symbol_keys: Vec<&str> = app.rows.iter().map(|r| r.key.as_str()).collect();
+        let unique_keys: HashSet<&str> = symbol_keys.iter().copied().collect();
+        assert_eq!(
+            symbol_keys.len(),
+            unique_keys.len(),
+            "expected zero duplicate rows: {symbol_keys:?}"
+        );
+    }
+
+    #[test]
+    fn cross_branch_repeats_and_collapse_keys_keep_cursor_on_target_entry() {
+        let head = r#"
+mod alpha {
+    pub fn run_a() { work(); }
+    pub fn extra_a() {}
+}
+mod beta {
+    pub fn run_b() { work(); }
+    pub fn extra_b() {}
+}
+pub fn work() { sub(); }
+fn sub() {}
+"#;
+        let a = analysis::analyze(&analysis::Inputs {
+            files: vec![("src/lib.rs".into(), None, Some(head.into()))],
+            extra_head: vec![],
+            include_tests: false,
+        });
+        let roots = a.entry_points.clone();
+        let mut app = App::new(a, roots, true);
+
+        // Expand alpha::run_a's child `work` -> shows `sub`
+        let first_helper_idx = app
+            .rows
+            .iter()
+            .position(|r| r.key.ends_with("::work") && !r.is_repeat)
+            .expect("primary work row");
+        app.sel = first_helper_idx;
+        app.handle_key(KeyCode::Enter);
+        assert_eq!(app.rows.iter().filter(|r| r.key.ends_with("::sub")).count(), 1);
+
+        // Second occurrence under beta::run_b is marked as `[↗ above]` repeat,
+        // has_children == false, and never duplicates `sub`.
+        let second_helper_idx = app
+            .rows
+            .iter()
+            .position(|r| r.key.ends_with("::work") && r.is_repeat)
+            .expect("reference work row");
+        assert!(!app.rows[second_helper_idx].has_children);
+
+        // Pressing `h` on the leaf under run_b collapses run_b and lands cursor directly on run_b
+        // without collapsing alpha::run_a above!
+        app.sel = second_helper_idx;
+        app.handle_key(KeyCode::Char('h'));
+        assert!(
+            app.rows[app.sel].key.ends_with("beta::run_b"),
+            "expected cursor to land on collapsed parent run_b, got {}",
+            app.rows[app.sel].key
+        );
+        assert_eq!(
+            app.rows.iter().filter(|r| r.key.ends_with("::sub")).count(),
+            1,
+            "collapsing beta branch must not collapse alpha branch above"
         );
     }
 }
